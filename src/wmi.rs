@@ -5,9 +5,17 @@
 //! exists — everything is raw COM `ExecMethod` via the shared `comwbem`
 //! module.
 
+use std::cell::Cell;
+
 use crate::comwbem::{self, Bstr, ClassObject, ComApartment, ComRef, Variant, CIM_UINT32, CIM_UINT64};
+use crate::log;
 use windows_sys::Win32::Foundation::REGDB_E_CLASSNOTREG;
 use windows_sys::Win32::System::Wmi::{WBEM_E_INVALID_CLASS, WBEM_E_NOT_FOUND};
+
+/// Consecutive WMI failures after which the adapter disables itself: a
+/// flapping/starving provider can destabilize in-proc WbemCore to the point
+/// of access violations, so repeated failures must stop all further calls.
+const MAX_ADAPTER_FAILURES: u32 = 5;
 
 /// Acer firmware platform profile values (prior art, spec-confirmed).
 pub const PROFILE_QUIET: u32 = 0;
@@ -69,9 +77,15 @@ const IN_PARAM: &str = "gmInput";
 const OUT_PARAM: &str = "gmOutput";
 
 pub struct WmiAdapter {
-    _com: ComApartment,
     services: ComRef,
     class: ClassObject,
+    /// Dropped LAST: CoUninitialize must follow the Release of every COM
+    /// object, so this field is declared after the interface handles.
+    _com: ComApartment,
+    /// Consecutive failed calls; disables the adapter at `MAX_ADAPTER_FAILURES`.
+    failures: Cell<u32>,
+    /// When set, every call short-circuits to `NotAvailable`.
+    dead: Cell<bool>,
 }
 
 // COM objects are apartment-bound; the adapter is only ever used from the
@@ -103,7 +117,18 @@ impl WmiAdapter {
                 WmiError::Com { hr, op: "GetObject(AcerGamingFunction)" }
             }
         })?;
-        Ok(Self { _com, services, class })
+        Ok(Self {
+            _com,
+            services,
+            class,
+            failures: Cell::new(0),
+            dead: Cell::new(false),
+        })
+    }
+
+    /// Adapter still usable (not disabled by a failure streak)?
+    pub fn is_available(&self) -> bool {
+        !self.dead.get()
     }
 
     /// Set the firmware platform profile (write via `SetGamingMiscSetting`).
@@ -136,6 +161,25 @@ impl WmiAdapter {
     }
 
     fn exec_method(&self, method: &'static str, input: u64) -> Result<Option<u64>, WmiError> {
+        if self.dead.get() {
+            return Err(WmiError::NotAvailable);
+        }
+        let result = self.exec_method_inner(method, input);
+        match &result {
+            Ok(_) => self.failures.set(0),
+            Err(_) => {
+                let count = self.failures.get() + 1;
+                self.failures.set(count);
+                if count >= MAX_ADAPTER_FAILURES {
+                    self.dead.set(true);
+                    log::warn("wmi: adapter disabled after repeated failures; running degraded");
+                }
+            }
+        }
+        result
+    }
+
+    fn exec_method_inner(&self, method: &'static str, input: u64) -> Result<Option<u64>, WmiError> {
         unsafe {
             let method_wide = comwbem::wide(method);
             let mut in_signature: *mut core::ffi::c_void = core::ptr::null_mut();

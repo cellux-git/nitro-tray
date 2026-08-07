@@ -121,7 +121,7 @@ impl AppCore {
     pub fn effective(&self) -> EffectiveState {
         let snapshot = power_state::read();
         let profile = match self.wmi.as_ref() {
-            Some(wmi) => match wmi.get_platform_profile() {
+            Some(wmi) if wmi.is_available() => match wmi.get_platform_profile() {
                 Ok(value) => profile_from_firmware(value),
                 Err(err) => {
                     LOGGED_WMI_PROFILE_READ.call_once(|| {
@@ -130,7 +130,7 @@ impl AppCore {
                     None
                 }
             },
-            None => None,
+            Some(_) | None => None,
         };
         let plan = match PowerApi::active_plan_name() {
             Ok(name) => Some(name),
@@ -142,7 +142,7 @@ impl AppCore {
             }
         };
         let smart_charge = match self.charge.as_ref() {
-            Some(charge) => match charge.is_enabled() {
+            Some(charge) if charge.is_available() => match charge.is_enabled() {
                 Ok(enabled) => Some(enabled),
                 Err(err) => {
                     LOGGED_CHARGE_READ.call_once(|| {
@@ -151,7 +151,7 @@ impl AppCore {
                     None
                 }
             },
-            None => None,
+            Some(_) | None => None,
         };
         EffectiveState {
             power: snapshot.state,
@@ -159,7 +159,7 @@ impl AppCore {
             profile,
             plan,
             smart_charge,
-            wmi_available: self.wmi.is_some(),
+            wmi_available: self.wmi.as_ref().is_some_and(|wmi| wmi.is_available()),
             eco_disabled: self.eco_accepted == Some(false),
         }
     }

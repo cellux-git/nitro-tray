@@ -4,11 +4,22 @@
 //! `.scratch/nitro-tray/prior-art-aeroforge.md`). No interpreter is spawned.
 //! Raw COM `ExecMethod` via the shared `comwbem` module.
 
+use std::cell::Cell;
 use std::time::Duration;
 
 use windows_sys::Win32::System::Wmi::WBEM_E_NOT_FOUND;
 
-use crate::comwbem::{self, Bstr, ClassObject, ComApartment, ComRef, Variant, CIM_UINT8};
+use crate::comwbem::{self, Bstr, ClassObject, ComApartment, ComRef, Variant, CIM_FLAG_ARRAY, CIM_UINT8};
+use crate::log;
+
+/// CIMTYPE for the `UInt8Array`-declared parameters (`uReservedIn`/`uReserved`):
+/// the array flag is required or WMI rejects the put with
+/// `WBEM_E_INVALID_PARAMETER`.
+const CIM_UINT8_ARRAY: i32 = CIM_UINT8 | CIM_FLAG_ARRAY;
+
+/// Consecutive failures after which the adapter disables itself (a flapping
+/// provider can destabilize in-proc WbemCore into access violations).
+const MAX_ADAPTER_FAILURES: u32 = 5;
 
 /// Errors from the smart-charge WMI layer.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -80,9 +91,15 @@ pub fn method_succeeded(hr: i32, return_value: Option<u32>) -> bool {
 }
 
 pub struct SmartChargeAdapter {
-    _com: ComApartment,
     services: ComRef,
     class: ClassObject,
+    /// Dropped LAST: CoUninitialize must follow the Release of every COM
+    /// object, so this field is declared after the interface handles.
+    _com: ComApartment,
+    /// Consecutive failed calls; disables the adapter at `MAX_ADAPTER_FAILURES`.
+    failures: Cell<u32>,
+    /// When set, every call short-circuits to `NotAvailable`.
+    dead: Cell<bool>,
 }
 
 // COM objects are apartment-bound; the adapter is only ever used from the
@@ -103,63 +120,102 @@ impl SmartChargeAdapter {
             .map_err(|_| ChargeError::NotAvailable)?;
         let class = unsafe { comwbem::get_class(&services, CLASS_NAME) }
             .map_err(|_| ChargeError::NotAvailable)?;
-        Ok(Self { _com, services, class })
+        Ok(Self {
+            _com,
+            services,
+            class,
+            failures: Cell::new(0),
+            dead: Cell::new(false),
+        })
+    }
+
+    /// Adapter still usable (not disabled by a failure streak)?
+    pub fn is_available(&self) -> bool {
+        !self.dead.get()
+    }
+
+    /// Runs `call` guarded by the failure-streak circuit breaker; the adapter
+    /// disables itself after `MAX_ADAPTER_FAILURES` consecutive errors.
+    fn guarded<T>(
+        &self,
+        call: impl FnOnce() -> Result<T, ChargeError>,
+    ) -> Result<T, ChargeError> {
+        if self.dead.get() {
+            return Err(ChargeError::NotAvailable);
+        }
+        let result = call();
+        match &result {
+            Ok(_) => self.failures.set(0),
+            Err(_) => {
+                let count = self.failures.get() + 1;
+                self.failures.set(count);
+                if count >= MAX_ADAPTER_FAILURES {
+                    self.dead.set(true);
+                    log::warn("charge: adapter disabled after repeated failures");
+                }
+            }
+        }
+        result
     }
 
     /// Toggle the 80% charge cap via the AMD direct-trust write path
     /// (`SetBatteryHealthControl` with the proven tuple).
     pub fn set_enabled(&self, enabled: bool) -> Result<(), ChargeError> {
-        let status = u8::from(enabled);
-        let mut attempts: Vec<(u8, u8, u8, [u8; 5])> = vec![direct_trust_tuple(status)];
-        attempts.extend(fallback_tuples(status));
-        let path = unsafe { comwbem::first_instance_path(&self.services, CLASS_NAME) }
-            .map_err(|hr| ChargeError::Com { hr, op: "first_instance_path(BatteryControl)" })?;
-        let mut last_rejected: Option<u32> = None;
-        let mut last_error: Option<ChargeError> = None;
-        for (battery, mask, status_byte, _reserved) in attempts {
-            match self.exec_set(&path, battery, mask, status_byte) {
-                Ok(Some(return_value)) => {
-                    if method_succeeded(0, Some(return_value)) {
-                        return Ok(());
+        self.guarded(|| {
+            let status = u8::from(enabled);
+            let mut attempts: Vec<(u8, u8, u8, [u8; 5])> = vec![direct_trust_tuple(status)];
+            attempts.extend(fallback_tuples(status));
+            let path = unsafe { comwbem::first_instance_path(&self.services, CLASS_NAME) }
+                .map_err(|hr| ChargeError::Com { hr, op: "first_instance_path(BatteryControl)" })?;
+            let mut last_rejected: Option<u32> = None;
+            let mut last_error: Option<ChargeError> = None;
+            for (battery, mask, status_byte, _reserved) in attempts {
+                match self.exec_set(&path, battery, mask, status_byte) {
+                    Ok(Some(return_value)) => {
+                        if method_succeeded(0, Some(return_value)) {
+                            return Ok(());
+                        }
+                        last_rejected = Some(return_value);
                     }
-                    last_rejected = Some(return_value);
+                    Ok(None) => last_rejected = Some(0),
+                    Err(e) => last_error = Some(e),
                 }
-                Ok(None) => last_rejected = Some(0),
-                Err(e) => last_error = Some(e),
+                std::thread::sleep(ATTEMPT_DELAY);
             }
-            std::thread::sleep(ATTEMPT_DELAY);
-        }
-        match last_error {
-            Some(e) => Err(e),
-            None => Err(ChargeError::Unexpected(format!(
-                "provider rejected every SetBatteryHealthControl tuple (last ReturnValue={})",
-                last_rejected.unwrap_or(0)
-            ))),
-        }
+            match last_error {
+                Some(e) => Err(e),
+                None => Err(ChargeError::Unexpected(format!(
+                    "provider rejected every SetBatteryHealthControl tuple (last ReturnValue={})",
+                    last_rejected.unwrap_or(0)
+                ))),
+            }
+        })
     }
 
     /// Read back the current smart-charge state (`GetBatteryHealthControlStatus`).
     pub fn is_enabled(&self) -> Result<bool, ChargeError> {
-        let path = unsafe { comwbem::first_instance_path(&self.services, CLASS_NAME) }
-            .map_err(|hr| ChargeError::Com { hr, op: "first_instance_path(BatteryControl)" })?;
-        let mut rows: Vec<(u32, Vec<u8>)> = Vec::new();
-        for battery in 0u8..5 {
-            for query in 0u8..7 {
-                if let Some(row) = self.exec_get(&path, battery, query)? {
-                    rows.push(row);
+        self.guarded(|| {
+            let path = unsafe { comwbem::first_instance_path(&self.services, CLASS_NAME) }
+                .map_err(|hr| ChargeError::Com { hr, op: "first_instance_path(BatteryControl)" })?;
+            let mut rows: Vec<(u32, Vec<u8>)> = Vec::new();
+            for battery in 0u8..5 {
+                for query in 0u8..7 {
+                    if let Some(row) = self.exec_get(&path, battery, query)? {
+                        rows.push(row);
+                    }
                 }
             }
-        }
-        let refs: Vec<(u32, &[u8])> = rows
-            .iter()
-            .map(|(list, statuses)| (*list, statuses.as_slice()))
-            .collect();
-        match desired_status_from_rows(&refs) {
-            Some(status) => Ok(status == 1),
-            None => Err(ChargeError::Unexpected(
-                "no health status found across GetBatteryHealthControlStatus sweep".into(),
-            )),
-        }
+            let refs: Vec<(u32, &[u8])> = rows
+                .iter()
+                .map(|(list, statuses)| (*list, statuses.as_slice()))
+                .collect();
+            match desired_status_from_rows(&refs) {
+                Some(status) => Ok(status == 1),
+                None => Err(ChargeError::Unexpected(
+                    "no health status found across GetBatteryHealthControlStatus sweep".into(),
+                )),
+            }
+        })
     }
 
     /// Executes `SetBatteryHealthControl` with one tuple; returns the
@@ -182,7 +238,7 @@ impl SmartChargeAdapter {
             in_params.put(
                 comwbem::wide("uReservedIn").as_ptr(),
                 &reserved_v,
-                CIM_UINT8,
+                CIM_UINT8_ARRAY,
             )
         };
         if hr != 0 {
@@ -205,7 +261,7 @@ impl SmartChargeAdapter {
         let parray = unsafe { comwbem::uint8_array(2) }
             .ok_or_else(|| ChargeError::Unexpected("SafeArrayCreate(uReserved) failed".into()))?;
         let reserved_v = Variant::from_array(parray);
-        let hr = unsafe { in_params.put(comwbem::wide("uReserved").as_ptr(), &reserved_v, CIM_UINT8) };
+        let hr = unsafe { in_params.put(comwbem::wide("uReserved").as_ptr(), &reserved_v, CIM_UINT8_ARRAY) };
         if hr != 0 {
             return Err(ChargeError::Com { hr, op: "Put(uReserved)" });
         }
@@ -292,7 +348,6 @@ fn read_status_array(object: &ClassObject) -> Result<Vec<u8>, ChargeError> {
     };
     Ok(value.as_u8_array().unwrap_or_default())
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;

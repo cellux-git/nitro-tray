@@ -41,6 +41,11 @@ pub const VT_UI4: u16 = 19;
 pub const VT_I8: u16 = 20;
 pub const VT_UI8: u16 = 21;
 pub const VT_ARRAY: u16 = 0x2000;
+/// `VT_UI1 | VT_ARRAY` as a single value. Defined as a const because in a
+/// `match` arm the `|` is pattern alternation ("17 or 0x2000"), not bitwise
+/// OR — writing the expression inline would silently miscompile the Drop
+/// (scalar UI1 variants would be treated as arrays).
+pub const VT_UI1_ARRAY: u16 = VT_UI1 | VT_ARRAY;
 
 // Real wbemcli.h CIMTYPE values. windows-sys 0.61 generates the CIM_*
 // constants from the oleaut VARENUM values instead (CIM_SINT16=2,
@@ -254,7 +259,9 @@ pub struct IEnumWbemClassObject_Vtbl {
 }
 
 /// Minimal C-layout `VARIANT` covering the members WMI in/out parameters use.
-/// Owns its payload: `Drop` frees BSTR/SAFEARRAY contents.
+/// `repr(C)` and sized to the real oleaut layout (24 bytes on x64: 8-byte
+/// header + 16-byte union with `DECIMAL`) so WMI never writes past the
+/// struct. Owns its payload: `Drop` frees BSTR/SAFEARRAY contents.
 #[repr(C)]
 pub struct Variant {
     vt: u16,
@@ -262,6 +269,16 @@ pub struct Variant {
     _w_reserved2: u16,
     _w_reserved3: u16,
     data: VariantData,
+}
+
+/// Opaque `DECIMAL` (16 bytes) — only needed to size the union exactly.
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct VariantDecimal {
+    w_reserved: u16,
+    signscale: u16,
+    hi32: u32,
+    lo64: u64,
 }
 
 #[repr(C)]
@@ -275,6 +292,7 @@ union VariantData {
     ull_val: u64,
     bstr_val: BSTR,
     parray: *mut SAFEARRAY,
+    dec_val: VariantDecimal,
 }
 
 impl Variant {
@@ -397,7 +415,7 @@ impl Drop for Variant {
         unsafe {
             match self.vt {
                 VT_BSTR => SysFreeString(self.data.bstr_val),
-                VT_UI1 | VT_ARRAY => {
+                VT_UI1_ARRAY => {
                     let _ = SafeArrayDestroy(self.data.parray);
                 }
                 _ => {}
@@ -691,7 +709,8 @@ pub unsafe fn first_instance_path(services: &ComRef, class: &str) -> Result<Bstr
 }
 
 /// Create a zero-initialized `uint8[len]` SAFEARRAY (caller hands ownership
-/// to a `Variant::from_array`).
+/// to a `Variant::from_array`). `SafeArrayCreate` takes the base element type
+/// (`VT_UI1`), not the `VT_ARRAY`-flagged combination — the flag makes it fail.
 ///
 /// # Safety
 /// The returned array must be handed to exactly one owner (`Variant`,
@@ -702,7 +721,7 @@ pub unsafe fn uint8_array(len: usize) -> Option<*mut SAFEARRAY> {
             cElements: len as u32,
             lLbound: 0,
         };
-        let parray = SafeArrayCreate(VT_UI1 | VT_ARRAY, 1, &bound);
+        let parray = SafeArrayCreate(VT_UI1, 1, &bound);
         if parray.is_null() {
             return None;
         }
@@ -753,3 +772,14 @@ pub unsafe fn exec_method(
         Ok(Some(ClassObject::from_raw(out_params)))
     }
 }
+
+#[cfg(test)]
+mod size_tests {
+    use super::*;
+    #[test]
+    fn variant_is_24_bytes_like_oleaut() {
+        assert_eq!(std::mem::size_of::<Variant>(), 24);
+        assert_eq!(std::mem::align_of::<Variant>(), 8);
+    }
+}
+
