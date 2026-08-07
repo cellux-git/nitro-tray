@@ -42,6 +42,7 @@ comwbem carries a `# Safety` contract.
 | 14 Docs | `README.md` |
 | 15 WMI recovery | `src/recovery.rs`, readback parts of `src/charge.rs`, reconnect parts of `src/app.rs`, timer parts of `src/main.rs` + `src/tray.rs` |
 | 16 MI transport | `src/mi.rs`, transport parts of `src/wmi.rs` + `src/charge.rs` |
+| 17 Linux port | (design ticket — ownership to be assigned per sub-ticket once split) |
 | (shared) | `src/comwbem.rs` — owned by nobody; kept since ticket 16 only as the COM-side diagnostic plumbing for `probe_com_shapes` (no adapter uses it anymore) |
 
 `src/main.rs` is extended sequentially (01 -> 08 -> 09 -> 10 -> 12 -> 11 -> 13).
