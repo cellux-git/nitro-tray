@@ -136,7 +136,62 @@ Uninstall keeps the plans; quitting keeps the current profile and plan active.
   overhead minimal.
 - No telemetry, no auto-update.
 
+## Building from source
+
+### Prerequisites
+
+- Rust **stable** with the MSVC toolchain (`rustup default stable-x86_64-pc-windows-msvc`)
+- Visual Studio Build Tools 2022 with the C++ workload and the Windows 10/11 SDK
+- Git
+
+### Build
+
+```text
+git clone <this-repo>
+cd nitro-tray
+
+# Debug build (fast, unoptimized)
+cargo build
+
+# Release build — the exe you actually run
+cargo build --release
+```
+
+The release binary lands at `target\release\nitro-tray.exe` (debug:
+`target\debug\nitro-tray.exe`). It is a single, self-contained exe — the admin
+manifest and all runtime code are embedded, and there are no DLLs or other
+files to ship next to it.
+
+### Verify
+
+```text
+cargo test          # unit tests (policy engine, config, encodings, ...)
+cargo clippy        # lints; the project is clippy-clean
+```
+
+### Probe binaries
+
+The build also produces elevated, on-device hardware diagnostic binaries
+(`target\release\probe-wmi.exe`, `probe-hid.exe`, `probe-charge.exe`,
+`probe-power.exe`). Run them **elevated on the target laptop** to verify the
+hardware paths (see [Development](#development)).
+
+### Run the freshly built exe
+
+1. Put `nitro-tray.exe` in a folder you own (the app writes
+   `nitro-tray.log`, `nitro-tray.toml`, and `nitro-tray.state.toml` beside
+   itself, so the folder must be writable — avoid `Program Files`).
+2. Launch it once (accept the UAC prompt). The app installs the `NitroTray`
+   logon scheduled task so it starts silently and already elevated at every
+   logon.
+3. Optional: drop a `nitro-tray.toml` beside the exe (see
+   [Configuration](#configuration)); without it the app runs on defaults.
+
 ## Development
+
+Code layout and the module seam contract live in
+`.scratch/nitro-tray/interfaces.md`; the hardware opcode tables (ported from
+the AeroForge project) are documented in `.scratch/nitro-tray/prior-art-aeroforge.md`.
 
 ```text
 cargo build
