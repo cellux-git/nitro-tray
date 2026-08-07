@@ -72,3 +72,12 @@ Found and fixed the silent startup crash (AV 0xC0000005 in release, no panic): e
 ## Comments (reboot verification 2026-08-07)
 
 After reboot: AcerGamingFunction is registered/unregistered by a user-mode component - the class was missing from ROOT\WMI right after logon and reappeared minutes later (flapping registration while Acer services are disabled). AcerDeviceEnablingServiceV2 was re-enabled per user hint: class registration stabilized, but Put(gmInput) on the method-input instance is STILL rejected with WBEM_E_INVALID_PARAMETER - conclusive that the native COM path cannot run on this machine (AeroForge's identical native path fails the same way here; their working path on this machine is the PowerShell CIM fallback). HID (probe-hid: open + Quiet/Normal/Performance writes ok) and power plans (probe-power: all four Nitro plans exist with correct tuning, active = Nitro-Balanced) fully verified on-device. On-device WMI verification for the AN16S-61 still required.
+
+## Comments (crash debugging + hardening 2026-08-07, late)
+
+Completing the startup-crash work (commit `22b9a37`, after the earlier vtable fix in `d5feda9`):
+
+- **ComApartment drop order**: `_com` was the first field in `WmiAdapter`, so CoUninitialize ran before the interface Releases -> teardown AV. Reordered (services, class, _com) so the apartment guard drops last.
+- **Circuit breaker**: `WmiAdapter` now self-disables after 5 consecutive failures (`failures`/`dead` cells, `is_available()`); `app.rs::effective()` gates profile readback on `is_available()` and `wmi_available` reflects the degraded state. A flapping/starving provider degrades to a logged warning instead of destabilizing in-proc WbemCore into access violations.
+- Shared fixes in comwbem.rs (Variant Drop alternation bug, 24-byte VARIANT, SafeArrayCreate base-VT) also apply here — details in ticket 07.
+- Machine state: WMI provider still flaps on the dev machine; app now starts cleanly and runs degraded (WARN lines) with the tray + message pump alive, which is the intended behavior. On-device verification (probe_wmi) on the AN16S-61 remains open.

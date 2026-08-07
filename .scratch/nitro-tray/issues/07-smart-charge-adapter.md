@@ -65,3 +65,16 @@ Needs on-device verification:
 ## Comments (code review)
 
 2026-08-07: Review fixes: (1) a SetBatteryHealthControl attempt now only counts as success when the provider's ReturnValue is present, truthy and not an error code (prior-art if ($setAnv.ReturnValue) semantics; missing ReturnValue => attempt failed); (2) fallback tuple list extended with mask-3 variants (1,3)/(0,3) per prior-art 3.3; (3) COM plumbing extracted into the shared src/comwbem.rs module (canonical vtables, one definition - previously duplicated in wmi.rs/charge.rs with drifted vtable tails); (4) CoUninitialize now happens exactly once when the apartment guard owns the init. Documented deviation: the SetBatteryFunctionData mask sweep (prior-art 3.3) is not ported - it is a fallback for unknown SKUs and the direct-trust path is the target path for this SKU; noted on device if the sweep is ever needed.
+
+## Comments (crash debugging + hardening 2026-08-07, late)
+
+Profile-selection crash (AV in oleaut32 at SafeArrayDestroy+0x2A) root-caused and fixed in the shared comwbem/charge layer:
+
+- **Variant::Drop alternation bug**: `match self.vt { VT_UI1 | VT_ARRAY => ... }` — in pattern position `|` is alternation, not bitwise OR — so the arm matched scalar vt==17 (VT_UI1) and fed the u8 union member (garbage pointer) to SafeArrayDestroy; real arrays (vt==0x2011) silently leaked. Fixed with a `VT_UI1_ARRAY` const (expression position = bitwise OR). After this, probe_charge completed the full 35-call sweep + ON/OFF/restore toggles with exit 0, no crashes.
+- **Variant sized 24 bytes** (real oleaut layout: 8-byte header + DECIMAL union 16 bytes) so WMI's `IWbemClassObject::Get` can never write past the struct. `size_tests::variant_is_24_bytes_like_oleaut` added.
+- **ComApartment drop order**: `_com` was the first field, so CoUninitialize ran before the COM interface Releases -> teardown AV. Reordered to drop last in both adapters.
+- **uint8_array**: `SafeArrayCreate` wants the base element type (VT_UI1); the VT_ARRAY-flagged combo (0x2011) returns NULL.
+- **CIMTYPE for array params**: `uReservedIn`/`uReserved` must be put as `CIM_UINT8 | CIM_FLAG_ARRAY` (0x2011); plain CIM_UINT8 -> WBEM_E_INVALID_PARAMETER.
+- **Circuit breaker**: adapter self-disables after 5 consecutive failures (`failures`/`dead` cells, `guarded()`), app gates readbacks on `is_available()`; a flapping provider now degrades to warnings instead of destabilizing in-proc WbemCore.
+
+On-device verification on the AN16S-61 (probe_charge) still required; this machine's WMI provider flapping makes the COM path unverifiable here (see ticket 05).
