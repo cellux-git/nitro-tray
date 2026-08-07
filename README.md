@@ -18,6 +18,11 @@ unavailable" state (see [Degraded mode](#degraded-mode)).
   restart is needed to apply changes.
 - **Single instance:** enforced via a named mutex.
 
+> **No Acer software required:** NitroSense and all Acer services
+> (`AASSvc`, `Acer Care Center`, `Acer Quick Access`, etc.) can be removed or
+> disabled — the app talks to the firmware directly through the driver-backed
+> WMI interface and does not depend on any Acer user-mode service.
+
 ## What it does
 
 At startup, on AC↔battery transitions, and on resume/wake, the app enforces a
