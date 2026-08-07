@@ -72,7 +72,10 @@ structure flat: one event-dispatch match, one set of `app` calls, one
    produces no notifications. Only the hotkey path calls `tray.notify(...)`.
 7. **In-process only**: never spawn PowerShell, `powercfg`, `schtasks`, or any
    external process at runtime. Build-time scripts and the probe binaries
-   (test-time diagnostics) are the only exceptions.
+   (test-time diagnostics) are the only exceptions. Note: windows-sys has no
+   TaskScheduler bindings (taskschd was removed from the shared Windows
+   metadata); `src/task.rs` uses the `winapi` crate's `taskschd` COM bindings
+   (correct GUIDs/vtables) — the only module allowed to depend on winapi.
 8. **Plan table (spec, authoritative — differs from AeroForge's)**: Quiet
    5/45 boost-off, Balanced 5/99 boost-default, Performance 5/100 boost-
    aggressive, Eco 5/40 boost-off. Plans created once from Windows Balanced

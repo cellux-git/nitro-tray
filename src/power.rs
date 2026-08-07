@@ -4,7 +4,7 @@
 //! other external process. Plans are never re-tuned after creation.
 
 use crate::policy::Profile;
-use windows_sys::Win32::Foundation::GUID;
+use windows_sys::core::GUID;
 
 /// The four Nitro plan names, in profile order (quiet, balanced, performance, eco).
 pub const NITRO_PLANS: [&str; 4] = ["Nitro-Quiet", "Nitro-Balanced", "Nitro-Performance", "Nitro-Eco"];

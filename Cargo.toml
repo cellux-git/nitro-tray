@@ -15,7 +15,11 @@ path = "src/main.rs"
 
 [dependencies]
 toml = "0.8"
-windows-sys = { version = "0.60", features = [
+# Task Scheduler 2.0 COM bindings are not part of windows-sys (taskschd was
+# removed from the shared metadata); winapi 0.3 ships correct, stable
+# bindings and GUIDs for taskschd. It is used ONLY by src/task.rs.
+winapi = { version = "0.3", features = ["taskschd", "combaseapi", "oleauto", "winerror", "libloaderapi", "objbase"] }
+windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Security",
     "Win32_System_Com",
@@ -24,7 +28,6 @@ windows-sys = { version = "0.60", features = [
     "Win32_System_Registry",
     "Win32_System_SystemInformation",
     "Win32_System_SystemServices",
-    "Win32_System_TaskScheduler",
     "Win32_System_Threading",
     "Win32_System_Wmi",
     "Win32_UI_Input_KeyboardAndMouse",
