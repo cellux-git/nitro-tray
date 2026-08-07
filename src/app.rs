@@ -4,10 +4,17 @@
 //! (`nitro-tray.state.toml` beside the exe), and the read-back effective
 //! state. Degrades gracefully when the Acer WMI interface is unreachable.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::Once;
 
+use crate::charge::SmartChargeAdapter;
 use crate::config::Config;
-use crate::policy::{PowerState, Profile};
+use crate::hid::HidAdapter;
+use crate::log;
+use crate::policy::{IntendedState, PolicyEngine, PowerState, Profile};
+use crate::power::PowerApi;
+use crate::power_state::{self, PowerStateSnapshot};
+use crate::wmi::{self, WmiAdapter};
 
 /// Filename of the persisted user state, beside the exe.
 pub const STATE_FILE_NAME: &str = "nitro-tray.state.toml";
@@ -29,94 +36,472 @@ pub struct EffectiveState {
     pub eco_disabled: bool,
 }
 
+/// Log each read-back failure kind at most once per process run.
+static LOGGED_WMI_PROFILE_READ: Once = Once::new();
+static LOGGED_PLAN_READ: Once = Once::new();
+static LOGGED_CHARGE_READ: Once = Once::new();
+
 pub struct AppCore {
-    // opaque
+    engine: PolicyEngine,
+    smart_charge: bool,
+    auto_switch: bool,
+    wmi: Option<WmiAdapter>,
+    charge: Option<SmartChargeAdapter>,
+    hid: Option<HidAdapter>,
+    eco_accepted: Option<bool>,
+    last_power: PowerStateSnapshot,
+    state_path: PathBuf,
 }
 
 impl AppCore {
     /// Construct the core: parse config-backed picks, load the state file,
     /// connect adapters (WMI/HID/charge failures degrade, never crash).
     pub fn new(config: Config, exe_dir: &Path) -> Self {
-        let _ = (config, exe_dir);
-        todo!("ticket 09: implement")
+        let mut engine = PolicyEngine::new(&config);
+        let mut smart_charge = config.smart_charge;
+
+        let wmi = match WmiAdapter::connect() {
+            Ok(adapter) => Some(adapter),
+            Err(err) => {
+                log::warn(format!("wmi: adapter unavailable; running degraded: {err:?}"));
+                None
+            }
+        };
+        let charge = match SmartChargeAdapter::connect() {
+            Ok(adapter) => Some(adapter),
+            Err(err) => {
+                log::warn(format!("charge: smart-charge adapter unavailable: {err:?}"));
+                None
+            }
+        };
+        let hid = match HidAdapter::open() {
+            Ok(adapter) => Some(adapter),
+            Err(err) => {
+                log::warn(format!("hid: usage-mode adapter unavailable: {err:?}"));
+                None
+            }
+        };
+
+        let state_path = exe_dir.join(STATE_FILE_NAME);
+        match std::fs::read_to_string(&state_path) {
+            Ok(contents) => {
+                let (picks, smart_override) = load_state(&contents);
+                if let Some((ac, battery)) = picks {
+                    match Profile::from_config_str(&ac) {
+                        Some(profile) => engine.set_profile(PowerState::Ac, profile),
+                        None => log::warn(format!("state: ignoring invalid ac pick {ac:?}")),
+                    }
+                    match Profile::from_config_str(&battery) {
+                        Some(profile) => engine.set_profile(PowerState::Battery, profile),
+                        None => log::warn(format!("state: ignoring invalid battery pick {battery:?}")),
+                    }
+                }
+                if let Some(value) = smart_override {
+                    smart_charge = value;
+                }
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => log::warn(format!("state: cannot read {}: {err}", state_path.display())),
+        }
+
+        AppCore {
+            engine,
+            smart_charge,
+            auto_switch: config.auto_switch,
+            wmi,
+            charge,
+            hid,
+            eco_accepted: None,
+            last_power: power_state::read(),
+            state_path,
+        }
     }
 
     /// Read the current effective state back from hardware/OS.
     pub fn effective(&self) -> EffectiveState {
-        todo!("ticket 09: implement")
+        let snapshot = power_state::read();
+        let profile = match self.wmi.as_ref() {
+            Some(wmi) => match wmi.get_platform_profile() {
+                Ok(value) => profile_from_firmware(value),
+                Err(err) => {
+                    LOGGED_WMI_PROFILE_READ.call_once(|| {
+                        log::warn(format!("wmi: platform profile readback failed: {err:?}"));
+                    });
+                    None
+                }
+            },
+            None => None,
+        };
+        let plan = match PowerApi::active_plan_name() {
+            Ok(name) => Some(name),
+            Err(err) => {
+                LOGGED_PLAN_READ.call_once(|| {
+                    log::warn(format!("power: active plan readback failed: {err:?}"));
+                });
+                None
+            }
+        };
+        let smart_charge = match self.charge.as_ref() {
+            Some(charge) => match charge.is_enabled() {
+                Ok(enabled) => Some(enabled),
+                Err(err) => {
+                    LOGGED_CHARGE_READ.call_once(|| {
+                        log::warn(format!("charge: smart-charge readback failed: {err:?}"));
+                    });
+                    None
+                }
+            },
+            None => None,
+        };
+        EffectiveState {
+            power: snapshot.state,
+            percent: snapshot.percent,
+            profile,
+            plan,
+            smart_charge,
+            wmi_available: self.wmi.is_some(),
+            eco_disabled: self.eco_accepted == Some(false),
+        }
     }
 
     /// Apply a profile immediately (full apply), persist the per-power-state
     /// pick, run eco runtime detection when the pick is eco.
     pub fn apply_profile(&mut self, profile: Profile) {
-        let _ = profile;
-        todo!("ticket 09: implement")
+        let snapshot = self.refresh_power();
+        self.engine.set_profile(snapshot.state, profile);
+        self.write_state_file();
+        if profile == Profile::Eco {
+            self.detect_eco();
+        }
+        self.apply_full(snapshot.state);
     }
 
     /// Cycle forward through the current power state's list, apply, persist;
     /// returns the new profile.
     pub fn cycle_profile(&mut self) -> Profile {
-        todo!("ticket 09: implement")
+        let snapshot = self.refresh_power();
+        let next = self.engine.cycle(snapshot.state);
+        self.write_state_file();
+        if next == Profile::Eco {
+            self.detect_eco();
+        }
+        self.apply_full(snapshot.state);
+        next
     }
 
     /// Toggle smart charge: apply, update intent (persisted so startup
     /// enforcement keeps the choice).
     pub fn toggle_smart_charge(&mut self) {
-        todo!("ticket 09: implement")
+        self.smart_charge = !self.smart_charge;
+        self.write_state_file();
+        let state = self.refresh_power().state;
+        self.apply_full(state);
     }
 
     /// Ensure the four Nitro plans exist (recreate deleted ones).
     pub fn ensure_nitro_plans(&mut self) {
-        todo!("ticket 09: implement")
+        if let Err(err) = PowerApi::ensure_nitro_plans() {
+            log::error(format!("power: failed to ensure Nitro plans: {err:?}"));
+        }
     }
 
     /// Full enforcement for the current power state, silently: ensure plans,
     /// then apply the intended state (profile, HID, fan auto, smart charge,
     /// plan). Used at startup, on power transitions, and on resume.
     pub fn enforce_now(&mut self) {
-        todo!("ticket 09: implement")
+        self.ensure_nitro_plans();
+        let snapshot = self.refresh_power();
+        self.apply_full(snapshot.state);
     }
 
     /// Firmware-only re-assertion (reapply loop): WMI profile, HID mode, fan
     /// auto, smart-charge state — never the active plan.
     pub fn reapply_firmware(&mut self) {
-        todo!("ticket 09: implement")
+        let snapshot = self.refresh_power();
+        let mut intent = self.engine.reapply_intended(snapshot.state, self.eco_ok());
+        intent.smart_charge = self.smart_charge;
+        self.apply_intended(&intent);
     }
 
-    /// Re-run eco acceptance detection (called on power transitions, on
-    /// reapply ticks, and after the first eco attempt).
+    /// Re-run eco acceptance detection when eco was rejected (called on power
+    /// transitions, on reapply ticks, and after the first eco attempt). Writes
+    /// firmware profile 6 directly and reads back; the previous firmware
+    /// profile is NOT restored here — callers re-apply the intended state
+    /// right after this returns.
     pub fn re_evaluate_eco(&mut self) {
-        todo!("ticket 09: implement")
+        if self.eco_accepted != Some(false) {
+            return;
+        }
+        self.detect_eco();
     }
 
     /// Acer WMI interface reachable?
     pub fn wmi_available(&self) -> bool {
-        todo!("ticket 09: implement")
+        self.wmi.is_some()
     }
 
     /// Eco entry disabled (firmware rejected profile 6)?
     pub fn eco_disabled(&self) -> bool {
-        todo!("ticket 09: implement")
+        self.eco_accepted == Some(false)
     }
 
     /// The current pick for a power state (for menu check marks).
     pub fn profile_for(&self, state: PowerState) -> Profile {
-        let _ = state;
-        todo!("ticket 09: implement")
+        self.engine.profile_for(state)
     }
 
     /// Current power state (last known snapshot).
     pub fn current_power(&self) -> PowerState {
-        todo!("ticket 09: implement")
+        self.last_power.state
     }
 
     /// Intended smart-charge state (config default, mutated by the toggle).
     pub fn smart_charge_intent(&self) -> bool {
-        todo!("ticket 09: implement")
+        self.smart_charge
+    }
+
+    /// Auto-switch on AC <-> battery transitions (config, immutable at runtime).
+    pub fn auto_switch(&self) -> bool {
+        self.auto_switch
+    }
+
+    /// Read power from the OS and cache the snapshot for `current_power()`.
+    fn refresh_power(&mut self) -> PowerStateSnapshot {
+        let snapshot = power_state::read();
+        self.last_power = snapshot;
+        snapshot
+    }
+
+    /// Eco acceptance in `bool` form for the policy engine.
+    fn eco_ok(&self) -> bool {
+        self.eco_accepted == Some(true)
+    }
+
+    /// Eco runtime detection: write firmware profile 6, then read back; the
+    /// machine accepts eco only when the readback equals 6. A set error or a
+    /// failed readback while WMI is available means rejected. Caches the
+    /// result in `eco_accepted` (design decision 2).
+    fn detect_eco(&mut self) {
+        let Some(wmi) = self.wmi.as_ref() else {
+            return;
+        };
+        if let Err(err) = wmi.set_platform_profile(wmi::PROFILE_ECO) {
+            log::warn(format!("wmi: eco detection failed to set profile 6: {err:?}"));
+            self.eco_accepted = Some(false);
+            return;
+        }
+        match wmi.get_platform_profile() {
+            Ok(value) => {
+                let accepted = value == wmi::PROFILE_ECO;
+                log::info(format!(
+                    "wmi: eco detection readback {value} (eco accepted: {accepted})"
+                ));
+                self.eco_accepted = Some(accepted);
+            }
+            Err(err) => {
+                log::warn(format!("wmi: eco detection readback failed: {err:?}"));
+                self.eco_accepted = Some(false);
+            }
+        }
+    }
+
+    /// Full intended apply for a power state, with the runtime smart-charge
+    /// intent. Runs first-time eco detection when the current pick is eco and
+    /// acceptance is still unknown (automatic enforcement paths).
+    fn apply_full(&mut self, state: PowerState) {
+        if self.engine.profile_for(state) == Profile::Eco && self.eco_accepted.is_none() {
+            self.detect_eco();
+        }
+        let mut intent = self.engine.intended(state, self.eco_ok());
+        intent.smart_charge = self.smart_charge;
+        self.apply_intended(&intent);
+    }
+
+    /// Apply one intended state to the hardware/OS: WMI profile, HID usage
+    /// mode (log-only on failure, never fatal), fan auto, smart charge, and
+    /// the active plan. Every item is applied independently; failures are
+    /// logged and never abort the rest.
+    fn apply_intended(&self, intent: &IntendedState) {
+        if let (Some(wmi), Some(value)) = (self.wmi.as_ref(), intent.firmware_profile) {
+            match wmi.set_platform_profile(value) {
+                Ok(()) => log::info(format!("wmi: platform profile set to {value}")),
+                Err(err) => log::warn(format!("wmi: failed to set platform profile {value}: {err:?}")),
+            }
+        }
+        if let Some(hid) = self.hid.as_ref() {
+            match hid.set_usage_mode(intent.hid_mode) {
+                Ok(()) => log::info(format!("hid: usage mode set to {:?}", intent.hid_mode)),
+                Err(err) => {
+                    log::warn(format!("hid: failed to set usage mode {:?}: {err:?}", intent.hid_mode))
+                }
+            }
+        }
+        if let Some(wmi) = self.wmi.as_ref() {
+            match wmi.set_fan_auto() {
+                Ok(()) => log::info("wmi: fan set to auto"),
+                Err(err) => log::warn(format!("wmi: failed to set fan auto: {err:?}")),
+            }
+        }
+        if let Some(charge) = self.charge.as_ref() {
+            match charge.set_enabled(intent.smart_charge) {
+                Ok(()) => log::info(format!("charge: smart charge set to {}", intent.smart_charge)),
+                Err(err) => {
+                    log::warn(format!("charge: failed to set smart charge {}: {err:?}", intent.smart_charge))
+                }
+            }
+        }
+        if let Some(plan) = intent.plan {
+            match PowerApi::set_active_plan(plan) {
+                Ok(()) => log::info(format!("power: active plan set to {plan}")),
+                Err(err) => log::warn(format!("power: failed to set active plan {plan}: {err:?}")),
+            }
+        }
+    }
+
+    /// Persist picks + smart-charge intent to the state file.
+    fn write_state_file(&self) {
+        let text = serialize_state(self.engine.picks(), self.smart_charge);
+        if let Err(err) = std::fs::write(&self.state_path, text) {
+            log::warn(format!("state: cannot write {}: {err}", self.state_path.display()));
+        }
+    }
+}
+
+/// Parse state-file TOML text into `(picks, smart_charge)` overrides.
+/// Missing or malformed content yields `(None, None)`; partial entries are
+/// ignored as a whole.
+fn load_state(toml_text: &str) -> (Option<(String, String)>, Option<bool>) {
+    let value: toml::Value = match toml::from_str(toml_text) {
+        Ok(value) => value,
+        Err(_) => return (None, None),
+    };
+    let Some(table) = value.as_table() else {
+        return (None, None);
+    };
+    let picks = table.get("picks").and_then(|picks| {
+        let table = picks.as_table()?;
+        Some((
+            table.get("ac")?.as_str()?.to_string(),
+            table.get("battery")?.as_str()?.to_string(),
+        ))
+    });
+    let smart_charge = table.get("smart_charge").and_then(|value| value.as_bool());
+    (picks, smart_charge)
+}
+
+/// Serialize picks + smart-charge intent as TOML text, parseable by
+/// `load_state` (round-trip tested).
+fn serialize_state(picks: (Profile, Profile), smart_charge: bool) -> String {
+    let mut root = toml::map::Map::new();
+    root.insert(
+        "smart_charge".to_string(),
+        toml::Value::Boolean(smart_charge),
+    );
+    let mut picks_table = toml::map::Map::new();
+    picks_table.insert("ac".to_string(), toml::Value::String(picks.0.as_str().to_string()));
+    picks_table.insert(
+        "battery".to_string(),
+        toml::Value::String(picks.1.as_str().to_string()),
+    );
+    root.insert("picks".to_string(), toml::Value::Table(picks_table));
+    toml::to_string(&toml::Value::Table(root)).unwrap_or_default()
+}
+
+/// Map a firmware platform-profile readback to a `Profile` (0 quiet, 1
+/// balanced, 4 performance, 6 eco); `None` for unknown values (e.g. turbo 5).
+fn profile_from_firmware(value: u32) -> Option<Profile> {
+    match value {
+        0 => Some(Profile::Quiet),
+        1 => Some(Profile::Balanced),
+        4 => Some(Profile::Performance),
+        6 => Some(Profile::Eco),
+        _ => None,
     }
 }
 
 #[cfg(test)]
 mod tests {
-    // ticket 09: state-file round trips, degraded wiring if testable.
+    use super::*;
+
+    #[test]
+    fn state_file_round_trip_picks_and_smart_charge() {
+        let text = serialize_state((Profile::Quiet, Profile::Eco), false);
+        let (picks, smart_charge) = load_state(&text);
+        assert_eq!(picks, Some(("quiet".to_string(), "eco".to_string())));
+        assert_eq!(smart_charge, Some(false));
+    }
+
+    #[test]
+    fn state_file_round_trip_all_profiles_and_toggles() {
+        for (ac, battery, smart) in [
+            ("quiet", "balanced", true),
+            ("balanced", "eco", false),
+            ("performance", "eco", true),
+        ] {
+            let text = serialize_state(
+                (
+                    Profile::from_config_str(ac).unwrap(),
+                    Profile::from_config_str(battery).unwrap(),
+                ),
+                smart,
+            );
+            let (picks, smart_charge) = load_state(&text);
+            assert_eq!(picks, Some((ac.to_string(), battery.to_string())));
+            assert_eq!(smart_charge, Some(smart));
+        }
+    }
+
+    #[test]
+    fn state_file_serialized_text_is_toml_parseable() {
+        let text = serialize_state((Profile::Performance, Profile::Balanced), true);
+        let parsed: toml::Value = toml::from_str(&text).unwrap();
+        let table = parsed.as_table().unwrap();
+        assert_eq!(table.get("smart_charge").unwrap().as_bool(), Some(true));
+        let picks = table.get("picks").unwrap().as_table().unwrap();
+        assert_eq!(picks.get("ac").unwrap().as_str(), Some("performance"));
+        assert_eq!(picks.get("battery").unwrap().as_str(), Some("balanced"));
+    }
+
+    #[test]
+    fn load_state_empty_and_malformed_give_defaults() {
+        assert_eq!(load_state(""), (None, None));
+        assert_eq!(load_state("smart_charge = = true"), (None, None));
+        assert_eq!(load_state("[picks"), (None, None));
+    }
+
+    #[test]
+    fn load_state_partial_picks_are_ignored() {
+        assert_eq!(load_state("[picks]\nac = \"quiet\""), (None, None));
+        assert_eq!(load_state("[picks]\nbattery = \"eco\""), (None, None));
+        assert_eq!(load_state("smart_charge = true"), (None, Some(true)));
+    }
+
+    #[test]
+    fn load_state_wrong_types_are_ignored() {
+        assert_eq!(load_state("[picks]\nac = 5\nbattery = true"), (None, None));
+        assert_eq!(load_state("smart_charge = \"yes\""), (None, None));
+    }
+
+    #[test]
+    fn load_state_ignores_unknown_keys() {
+        let text = "reapply = true\nsmart_charge = true\n[other]\nkey = 1\n[picks]\nac = \"balanced\"\nbattery = \"eco\"";
+        let (picks, smart_charge) = load_state(text);
+        assert_eq!(picks, Some(("balanced".to_string(), "eco".to_string())));
+        assert_eq!(smart_charge, Some(true));
+    }
+
+    #[test]
+    fn firmware_readback_maps_spec_values() {
+        assert_eq!(profile_from_firmware(0), Some(Profile::Quiet));
+        assert_eq!(profile_from_firmware(1), Some(Profile::Balanced));
+        assert_eq!(profile_from_firmware(4), Some(Profile::Performance));
+        assert_eq!(profile_from_firmware(6), Some(Profile::Eco));
+    }
+
+    #[test]
+    fn firmware_readback_unknown_values_give_none() {
+        for value in [2, 3, 5, 7, 0xFF] {
+            assert_eq!(profile_from_firmware(value), None, "value {value}");
+        }
+    }
 }

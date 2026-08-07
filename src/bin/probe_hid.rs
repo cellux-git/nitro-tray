@@ -113,8 +113,10 @@ impl RawDevice {
         let mut found = None;
         let mut index = 0u32;
         loop {
-            let mut if_data = SP_DEVICE_INTERFACE_DATA::default();
-            if_data.cbSize = std::mem::size_of::<SP_DEVICE_INTERFACE_DATA>() as u32;
+            let mut if_data = SP_DEVICE_INTERFACE_DATA {
+                cbSize: std::mem::size_of::<SP_DEVICE_INTERFACE_DATA>() as u32,
+                ..Default::default()
+            };
             let ok = unsafe {
                 SetupDiEnumDeviceInterfaces(info_set, core::ptr::null(), &hid_guid, index, &mut if_data)
             };

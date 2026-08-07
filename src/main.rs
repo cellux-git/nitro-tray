@@ -18,9 +18,11 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{DispatchMessageW, GetMessageW,
 
 use nitro_tray::app::AppCore;
 use nitro_tray::config;
+use nitro_tray::enforcement;
+use nitro_tray::hotkey::Hotkey;
 use nitro_tray::log;
-use nitro_tray::policy::{PowerState, AC_PROFILES, BATTERY_PROFILES};
-use nitro_tray::power_state;
+use nitro_tray::policy::{PowerState, Profile, AC_PROFILES, BATTERY_PROFILES};
+use nitro_tray::reapply;
 use nitro_tray::task;
 use nitro_tray::tray::{Tray, TrayEvent, TrayView};
 
@@ -46,7 +48,7 @@ fn main() {
         log::info("uninstall requested");
         match task::uninstall_logon_task() {
             Ok(()) => log::info("scheduled task removed"),
-            Err(e) => log::error(&format!("failed to remove scheduled task: {e:?}")),
+            Err(e) => log::error(format!("failed to remove scheduled task: {e:?}")),
         }
         return;
     }
@@ -60,39 +62,50 @@ fn main() {
     };
 
     let config = config::load(&exe_dir);
+    let hotkey_spec = config.hotkey.clone();
+    let reapply_cfg = config.clone();
     let mut app = AppCore::new(config, &exe_dir);
 
     if let Err(e) = task::install_logon_task(&exe_path) {
-        log::warn(&format!("failed to install logon task: {e:?}"));
+        log::warn(format!("failed to install logon task: {e:?}"));
     }
 
     let (event_tx, event_rx) = mpsc::channel();
     let tray = match Tray::create(event_tx) {
         Ok(tray) => tray,
         Err(e) => {
-            log::error(&format!("failed to create tray: {e:?}"));
+            log::error(format!("failed to create tray: {e:?}"));
             return;
         }
     };
 
-    let snapshot = power_state::read();
-    let view = TrayView {
-        power: snapshot.state,
-        percent: snapshot.percent,
-        profile: None,
-        profiles: match snapshot.state {
-            PowerState::Ac => AC_PROFILES.to_vec(),
-            PowerState::Battery => BATTERY_PROFILES.to_vec(),
-        },
-        profiles_greyed: false,
-        smart_charge: None,
-        smart_charge_greyed: false,
-        plan: None,
-        degraded: false,
-    };
+    let view = view_from(&app);
     if let Err(e) = tray.update(&view) {
-        log::warn(&format!("failed to update tray view: {e:?}"));
+        log::warn(format!("failed to update tray view: {e:?}"));
     }
+
+    // Kept alive for the process lifetime; `Drop` unregisters the hotkey.
+    let _hotkey = match Hotkey::register(tray.hwnd(), &hotkey_spec) {
+        Ok(hotkey) => {
+            log::info(format!("hotkey registered: {hotkey_spec}"));
+            Some(hotkey)
+        }
+        Err(err) => {
+            log::warn(format!("hotkey: failed to register {hotkey_spec:?}: {err:?}"));
+            None
+        }
+    };
+
+    if reapply::enabled(&reapply_cfg) {
+        let interval = reapply::interval_ms(&reapply_cfg);
+        match tray.start_timer(reapply::TIMER_ID, interval) {
+            Ok(()) => log::info(format!("reapply loop enabled; interval {interval} ms")),
+            Err(err) => log::warn(format!("reapply: failed to arm timer: {err:?}")),
+        }
+    }
+
+    enforcement::on_startup(&mut app);
+    log::info("startup enforcement complete");
 
     message_pump(&tray, &mut app, &event_rx);
     log::info("nitro-tray exiting");
@@ -145,8 +158,34 @@ fn message_pump(tray: &Tray, app: &mut AppCore, events: &mpsc::Receiver<TrayEven
     }
 }
 
+/// Build the tray view from the app's read-back effective state: profiles
+/// valid for the current power state (eco filtered out when the firmware
+/// rejected it), read-back values for the checked profile, smart charge and
+/// plan, and the degraded flags when the Acer WMI interface is unavailable.
+fn view_from(app: &AppCore) -> TrayView {
+    let effective = app.effective();
+    let mut profiles = match app.current_power() {
+        PowerState::Ac => AC_PROFILES.to_vec(),
+        PowerState::Battery => BATTERY_PROFILES.to_vec(),
+    };
+    if app.eco_disabled() {
+        profiles.retain(|profile| *profile != Profile::Eco);
+    }
+    TrayView {
+        power: effective.power,
+        percent: effective.percent,
+        profile: effective.profile,
+        profiles,
+        profiles_greyed: !app.wmi_available(),
+        smart_charge: effective.smart_charge,
+        smart_charge_greyed: !app.wmi_available(),
+        plan: effective.plan,
+        degraded: !app.wmi_available(),
+    }
+}
+
 /// One flat event dispatch; later tickets add match arms here
-/// (SelectProfile/ToggleSmartCharge: ticket 10, PowerChanged/Resume: ticket 12).
+/// (Hotkey: ticket 11, ReapplyTick: ticket 13).
 fn handle_event(app: &mut AppCore, tray: &Tray, ev: TrayEvent) {
     match ev {
         TrayEvent::Quit => {
@@ -154,18 +193,47 @@ fn handle_event(app: &mut AppCore, tray: &Tray, ev: TrayEvent) {
             // later tickets: unregister hotkey (11), destroy tray icon (08)
             unsafe { PostQuitMessage(0) };
         }
-        TrayEvent::SelectProfile(_profile) => {
-            // ticket 10: apply the picked profile for the current power state
+        TrayEvent::SelectProfile(profile) => {
+            log::info(format!("profile selected: {}", profile.as_str()));
+            app.apply_profile(profile);
+            if let Err(e) = tray.update(&view_from(app)) {
+                log::warn(format!("failed to update tray view: {e:?}"));
+            }
         }
         TrayEvent::ToggleSmartCharge => {
-            // ticket 10: toggle smart charge
+            app.toggle_smart_charge();
+            log::info(format!(
+                "smart charge toggled; intent: {}",
+                app.smart_charge_intent()
+            ));
+            if let Err(e) = tray.update(&view_from(app)) {
+                log::warn(format!("failed to update tray view: {e:?}"));
+            }
         }
         TrayEvent::PowerChanged => {
-            // ticket 12: enforce on power transitions
+            log::info("power state changed");
+            enforcement::on_power_changed(app);
+            if let Err(e) = tray.update(&view_from(app)) {
+                log::warn(format!("failed to update tray view: {e:?}"));
+            }
         }
         TrayEvent::Resume => {
-            // ticket 12: enforce on resume
+            log::info("system resumed");
+            enforcement::on_resume(app);
+            if let Err(e) = tray.update(&view_from(app)) {
+                log::warn(format!("failed to update tray view: {e:?}"));
+            }
+        }
+        TrayEvent::HotkeyPressed => {
+            let profile = app.cycle_profile();
+            log::info(format!("hotkey cycled to profile {}", profile.as_str()));
+            if let Err(e) = tray.update(&view_from(app)) {
+                log::warn(format!("failed to update tray view: {e:?}"));
+            }
+            tray.notify("Nitro Tray", &format!("Profile: {}", profile.as_str()));
+        }
+        TrayEvent::ReapplyTick => {
+            reapply::on_tick(app);
         }
     }
-    let _ = (app, tray);
 }

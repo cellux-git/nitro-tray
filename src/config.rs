@@ -200,11 +200,11 @@ mod tests {
              reapply_interval_secs = 120\n\
              hotkey = \"ctrl-alt-f\"\n",
         );
-        assert_eq!(cfg.smart_charge, false);
+        assert!(!cfg.smart_charge);
         assert_eq!(cfg.ac_profile, "performance");
         assert_eq!(cfg.battery_profile, "balanced");
-        assert_eq!(cfg.auto_switch, false);
-        assert_eq!(cfg.reapply, true);
+        assert!(!cfg.auto_switch);
+        assert!(cfg.reapply);
         assert_eq!(cfg.reapply_interval_secs, 120);
         assert_eq!(cfg.hotkey, "ctrl-alt-f");
         assert!(diags.is_empty());
@@ -279,7 +279,7 @@ mod tests {
         std::fs::write(dir.join(CONFIG_FILE_NAME), "reapply = true\nhotkey = \"ctrl-alt-shift-x\"").unwrap();
         let cfg = load(&dir);
         remove_dir(&dir);
-        assert_eq!(cfg.reapply, true);
+        assert!(cfg.reapply);
         assert_eq!(cfg.hotkey, "ctrl-alt-shift-x");
         assert_eq!(cfg, Config {
             reapply: true,
@@ -293,16 +293,16 @@ mod tests {
         let dir = temp_dir("load-full");
         std::fs::write(
             dir.join(CONFIG_FILE_NAME),
-            "smart_charge = false\nac_profile = \"performance\"\nbattery_profile = \"balanced\"\nauto_switch = false\nreapply = true\nreapply_interval_secs = 45\nhotkey = \"ctrl-alt-g\"",
+            "smart_charge = false\nac_profile = \"performance\"\nbattery_profile = \"balanced\"\nauto_switch = false\nreapply = true\n            reapply_interval_secs = 45\nhotkey = \"ctrl-alt-g\"",
         )
         .unwrap();
         let cfg = load(&dir);
         remove_dir(&dir);
-        assert_eq!(cfg.smart_charge, false);
+        assert!(!cfg.smart_charge);
         assert_eq!(cfg.ac_profile, "performance");
         assert_eq!(cfg.battery_profile, "balanced");
-        assert_eq!(cfg.auto_switch, false);
-        assert_eq!(cfg.reapply, true);
+        assert!(!cfg.auto_switch);
+        assert!(cfg.reapply);
         assert_eq!(cfg.reapply_interval_secs, 45);
         assert_eq!(cfg.hotkey, "ctrl-alt-g");
     }
