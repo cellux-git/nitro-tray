@@ -215,10 +215,8 @@ fn view_from(app: &AppCore) -> TrayView {
         .profile
         .or_else(|| effective.plan.as_deref().and_then(Profile::from_plan_name));
     // Read-back smart-charge state; when the adapter can't report it, show
-    // the intent the toggle actually controls (otherwise an unavailable
-    // readback renders the item unchecked and a click appears to "turn off"
-    // an already-enabled intent).
-    let smart_charge = effective.smart_charge.or(Some(app.smart_charge_intent()));
+    // the intent — smart charge is always intended on and cannot be disabled.
+    let smart_charge = effective.smart_charge.or(Some(true));
     TrayView {
         power: effective.power,
         percent: effective.percent,
@@ -228,7 +226,6 @@ fn view_from(app: &AppCore) -> TrayView {
         profiles_greyed: degraded,
         plans,
         smart_charge,
-        smart_charge_greyed: degraded,
         plan: effective.plan,
         degraded,
     }
@@ -246,16 +243,6 @@ fn handle_event(app: &mut AppCore, tray: &Tray, ev: TrayEvent) {
         TrayEvent::SelectProfile(profile) => {
             log::info(format!("profile selected: {}", profile.as_str()));
             app.apply_profile(profile);
-            if let Err(e) = tray.update(&view_from(app)) {
-                log::warn(format!("failed to update tray view: {e:?}"));
-            }
-        }
-        TrayEvent::ToggleSmartCharge => {
-            app.toggle_smart_charge();
-            log::info(format!(
-                "smart charge toggled; intent: {}",
-                app.smart_charge_intent()
-            ));
             if let Err(e) = tray.update(&view_from(app)) {
                 log::warn(format!("failed to update tray view: {e:?}"));
             }

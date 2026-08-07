@@ -53,7 +53,6 @@ const TRAY_MSG: u32 = WM_APP + 1;
 const WAKE_MSG: u32 = WM_APP + 2;
 const POLL_TIMER_ID: usize = 1;
 const MENU_PROFILE_BASE: usize = 1;
-const MENU_SMART_CHARGE: usize = 100;
 const MENU_PLAN_BASE: usize = 300;
 const MENU_QUIT: usize = 200;
 const ICON_SIZE: i32 = 16;
@@ -77,8 +76,6 @@ pub enum TrayEvent {
     Quit,
     /// The user picked a profile in the menu.
     SelectProfile(Profile),
-    /// The user toggled smart charge.
-    ToggleSmartCharge,
     /// Power status changed (WM_POWERBROADCAST or slow poll fallback).
     PowerChanged,
     /// The machine resumed from sleep (WM_POWERBROADCAST).
@@ -111,8 +108,6 @@ pub struct TrayView {
     pub plans: Vec<Profile>,
     /// Read-back smart-charge state; `None` when unavailable.
     pub smart_charge: Option<bool>,
-    /// Grey out the smart-charge item (degraded).
-    pub smart_charge_greyed: bool,
     /// Active Windows plan name; `None` when unknown.
     pub plan: Option<String>,
     /// Show the degraded "Hardware unavailable" state.
@@ -188,7 +183,6 @@ impl Tray {
                     profiles_greyed: false,
                     plans: Vec::new(),
                     smart_charge: None,
-                    smart_charge_greyed: false,
                     plan: None,
                     degraded: false,
                 }),
@@ -449,15 +443,16 @@ fn open_menu(hwnd: HWND, state: &TrayState) {
         append_item(menu, flags, MENU_PROFILE_BASE + i, profile_label(*profile));
     }
     append_separator(menu);
-    let mut smart_flags = if view.smart_charge_greyed {
-        MF_GRAYED | MF_DISABLED
-    } else {
-        0
-    };
-    if view.smart_charge == Some(true) {
-        smart_flags |= MF_CHECKED;
-    }
-    append_item(menu, smart_flags, MENU_SMART_CHARGE, "Smart charge (80% cap)");
+    // Smart charge is always intended on and cannot be disabled in the app;
+    // the item is a static status line (checked unless the readback says the
+    // cap is not in effect).
+    let smart_flags = MF_DISABLED
+        | if view.smart_charge != Some(false) {
+            MF_CHECKED
+        } else {
+            0
+        };
+    append_item(menu, smart_flags, 0, "Smart charge (80% cap)");
     if let Some(plan) = &view.plan {
         append_item(menu, MF_GRAYED | MF_DISABLED, 0, &format!("Plan: {plan}"));
     }
@@ -493,7 +488,6 @@ fn open_menu(hwnd: HWND, state: &TrayState) {
     }
     match cmd {
         MENU_QUIT => send_event(state, TrayEvent::Quit),
-        MENU_SMART_CHARGE => send_event(state, TrayEvent::ToggleSmartCharge),
         id if id >= MENU_PROFILE_BASE && id < MENU_PROFILE_BASE + view.profiles.len() => {
             if let Some(&profile) = view.profiles.get(id - MENU_PROFILE_BASE) {
                 send_event(state, TrayEvent::SelectProfile(profile));
@@ -669,7 +663,6 @@ mod tests {
             profiles_greyed: false,
             plans: Vec::new(),
             smart_charge: None,
-            smart_charge_greyed: false,
             plan: plan.map(String::from),
             degraded: false,
         }
@@ -686,7 +679,6 @@ mod tests {
             profiles_greyed: false,
             plans: Vec::new(),
             smart_charge: Some(true),
-            smart_charge_greyed: false,
             plan: Some("Nitro-Balanced".to_string()),
             degraded: false,
         };

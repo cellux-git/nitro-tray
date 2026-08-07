@@ -26,7 +26,8 @@ coherent power state:
 - firmware platform profile (via Acer WMI),
 - Acer HID usage mode,
 - fan behavior **auto**,
-- smart charge (80% charge cap, on by default),
+- smart charge (80% charge cap — always enforced on, best effort, cannot be
+  disabled),
 - the active Windows power plan.
 
 Profiles are chosen independently per power state:

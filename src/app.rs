@@ -43,7 +43,6 @@ static LOGGED_CHARGE_READ: Once = Once::new();
 
 pub struct AppCore {
     engine: PolicyEngine,
-    smart_charge: bool,
     auto_switch: bool,
     wmi: Option<WmiAdapter>,
     charge: Option<SmartChargeAdapter>,
@@ -58,7 +57,6 @@ impl AppCore {
     /// connect adapters (WMI/HID/charge failures degrade, never crash).
     pub fn new(config: Config, exe_dir: &Path) -> Self {
         let mut engine = PolicyEngine::new(&config);
-        let mut smart_charge = config.smart_charge;
 
         let wmi = match WmiAdapter::connect() {
             Ok(adapter) => Some(adapter),
@@ -85,7 +83,7 @@ impl AppCore {
         let state_path = exe_dir.join(STATE_FILE_NAME);
         match std::fs::read_to_string(&state_path) {
             Ok(contents) => {
-                let (picks, smart_override) = load_state(&contents);
+                let picks = load_state(&contents);
                 if let Some((ac, battery)) = picks {
                     match Profile::from_config_str(&ac) {
                         Some(profile) => engine.set_profile(PowerState::Ac, profile),
@@ -96,9 +94,6 @@ impl AppCore {
                         None => log::warn(format!("state: ignoring invalid battery pick {battery:?}")),
                     }
                 }
-                if let Some(value) = smart_override {
-                    smart_charge = value;
-                }
             }
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
             Err(err) => log::warn(format!("state: cannot read {}: {err}", state_path.display())),
@@ -106,7 +101,6 @@ impl AppCore {
 
         AppCore {
             engine,
-            smart_charge,
             auto_switch: config.auto_switch,
             wmi,
             charge,
@@ -193,15 +187,6 @@ impl AppCore {
         next
     }
 
-    /// Toggle smart charge: apply, update intent (persisted so startup
-    /// enforcement keeps the choice).
-    pub fn toggle_smart_charge(&mut self) {
-        self.smart_charge = !self.smart_charge;
-        self.write_state_file();
-        let state = self.refresh_power().state;
-        self.apply_full(state);
-    }
-
     /// Ensure the four Nitro plans exist (recreate deleted ones).
     pub fn ensure_nitro_plans(&mut self) {
         if let Err(err) = PowerApi::ensure_nitro_plans() {
@@ -222,8 +207,7 @@ impl AppCore {
     /// auto, smart-charge state — never the active plan.
     pub fn reapply_firmware(&mut self) {
         let snapshot = self.refresh_power();
-        let mut intent = self.engine.reapply_intended(snapshot.state, self.eco_ok());
-        intent.smart_charge = self.smart_charge;
+        let intent = self.engine.reapply_intended(snapshot.state, self.eco_ok());
         self.apply_intended(&intent);
     }
 
@@ -268,11 +252,6 @@ impl AppCore {
     /// Current power state (last known snapshot).
     pub fn current_power(&self) -> PowerState {
         self.last_power.state
-    }
-
-    /// Intended smart-charge state (config default, mutated by the toggle).
-    pub fn smart_charge_intent(&self) -> bool {
-        self.smart_charge
     }
 
     /// Auto-switch on AC <-> battery transitions (config, immutable at runtime).
@@ -338,22 +317,23 @@ impl AppCore {
         }
     }
 
-    /// Full intended apply for a power state, with the runtime smart-charge
-    /// intent. Runs first-time eco detection when the current pick is eco and
-    /// acceptance is still unknown (automatic enforcement paths).
+    /// Full intended apply for a power state. Runs first-time eco detection
+    /// when the current pick is eco and acceptance is still unknown
+    /// (automatic enforcement paths).
     fn apply_full(&mut self, state: PowerState) {
         if self.engine.profile_for(state) == Profile::Eco && self.eco_accepted.is_none() {
             self.detect_eco();
         }
-        let mut intent = self.engine.intended(state, self.eco_ok());
-        intent.smart_charge = self.smart_charge;
+        let intent = self.engine.intended(state, self.eco_ok());
         self.apply_intended(&intent);
     }
 
     /// Apply one intended state to the hardware/OS: WMI profile, HID usage
     /// mode (log-only on failure, never fatal), fan auto, smart charge, and
     /// the active plan. Every item is applied independently; failures are
-    /// logged and never abort the rest.
+    /// logged and never abort the rest. Smart charge is always targeted on —
+    /// it cannot be disabled in the app — so every apply is a best-effort
+    /// enable attempt (writes are retried by the reapply loop when enabled).
     fn apply_intended(&self, intent: &IntendedState) {
         if let (Some(wmi), Some(value)) = (self.wmi.as_ref(), intent.firmware_profile) {
             match wmi.set_platform_profile(value) {
@@ -376,11 +356,9 @@ impl AppCore {
             }
         }
         if let Some(charge) = self.charge.as_ref() {
-            match charge.set_enabled(intent.smart_charge) {
-                Ok(()) => log::info(format!("charge: smart charge set to {}", intent.smart_charge)),
-                Err(err) => {
-                    log::warn(format!("charge: failed to set smart charge {}: {err:?}", intent.smart_charge))
-                }
+            match charge.set_enabled(true) {
+                Ok(()) => log::info("charge: smart charge enabled"),
+                Err(err) => log::warn(format!("charge: failed to enable smart charge: {err:?}")),
             }
         }
         if let Some(plan) = intent.plan {
@@ -391,45 +369,35 @@ impl AppCore {
         }
     }
 
-    /// Persist picks + smart-charge intent to the state file.
+    /// Persist the per-power-state picks to the state file. Smart charge is
+    /// intentionally absent: it is always on and cannot be configured.
     fn write_state_file(&self) {
-        let text = serialize_state(self.engine.picks(), self.smart_charge);
+        let text = serialize_state(self.engine.picks());
         if let Err(err) = std::fs::write(&self.state_path, text) {
             log::warn(format!("state: cannot write {}: {err}", self.state_path.display()));
         }
     }
 }
 
-/// Parse state-file TOML text into `(picks, smart_charge)` overrides.
-/// Missing or malformed content yields `(None, None)`; partial entries are
-/// ignored as a whole.
-fn load_state(toml_text: &str) -> (Option<(String, String)>, Option<bool>) {
-    let value: toml::Value = match toml::from_str(toml_text) {
-        Ok(value) => value,
-        Err(_) => return (None, None),
-    };
-    let Some(table) = value.as_table() else {
-        return (None, None);
-    };
-    let picks = table.get("picks").and_then(|picks| {
+/// Parse state-file TOML text into `(picks)` overrides. Missing or malformed
+/// content yields `None`; partial entries are ignored as a whole. A legacy
+/// `smart_charge` key (the app no longer lets users disable it) is ignored.
+fn load_state(toml_text: &str) -> Option<(String, String)> {
+    let value: toml::Value = toml::from_str(toml_text).ok()?;
+    let table = value.as_table()?;
+    table.get("picks").and_then(|picks| {
         let table = picks.as_table()?;
         Some((
             table.get("ac")?.as_str()?.to_string(),
             table.get("battery")?.as_str()?.to_string(),
         ))
-    });
-    let smart_charge = table.get("smart_charge").and_then(|value| value.as_bool());
-    (picks, smart_charge)
+    })
 }
 
-/// Serialize picks + smart-charge intent as TOML text, parseable by
-/// `load_state` (round-trip tested).
-fn serialize_state(picks: (Profile, Profile), smart_charge: bool) -> String {
+/// Serialize picks as TOML text, parseable by `load_state` (round-trip
+/// tested).
+fn serialize_state(picks: (Profile, Profile)) -> String {
     let mut root = toml::map::Map::new();
-    root.insert(
-        "smart_charge".to_string(),
-        toml::Value::Boolean(smart_charge),
-    );
     let mut picks_table = toml::map::Map::new();
     picks_table.insert("ac".to_string(), toml::Value::String(picks.0.as_str().to_string()));
     picks_table.insert(
@@ -457,70 +425,64 @@ mod tests {
     use super::*;
 
     #[test]
-    fn state_file_round_trip_picks_and_smart_charge() {
-        let text = serialize_state((Profile::Quiet, Profile::Eco), false);
-        let (picks, smart_charge) = load_state(&text);
+    fn state_file_round_trip_picks() {
+        let text = serialize_state((Profile::Quiet, Profile::Eco));
+        let picks = load_state(&text);
         assert_eq!(picks, Some(("quiet".to_string(), "eco".to_string())));
-        assert_eq!(smart_charge, Some(false));
     }
 
     #[test]
-    fn state_file_round_trip_all_profiles_and_toggles() {
-        for (ac, battery, smart) in [
-            ("quiet", "balanced", true),
-            ("balanced", "eco", false),
-            ("performance", "eco", true),
+    fn state_file_round_trip_all_profiles() {
+        for (ac, battery) in [
+            ("quiet", "balanced"),
+            ("balanced", "eco"),
+            ("performance", "eco"),
         ] {
-            let text = serialize_state(
-                (
-                    Profile::from_config_str(ac).unwrap(),
-                    Profile::from_config_str(battery).unwrap(),
-                ),
-                smart,
-            );
-            let (picks, smart_charge) = load_state(&text);
+            let text = serialize_state((
+                Profile::from_config_str(ac).unwrap(),
+                Profile::from_config_str(battery).unwrap(),
+            ));
+            let picks = load_state(&text);
             assert_eq!(picks, Some((ac.to_string(), battery.to_string())));
-            assert_eq!(smart_charge, Some(smart));
         }
     }
 
     #[test]
     fn state_file_serialized_text_is_toml_parseable() {
-        let text = serialize_state((Profile::Performance, Profile::Balanced), true);
+        let text = serialize_state((Profile::Performance, Profile::Balanced));
         let parsed: toml::Value = toml::from_str(&text).unwrap();
         let table = parsed.as_table().unwrap();
-        assert_eq!(table.get("smart_charge").unwrap().as_bool(), Some(true));
+        assert!(table.get("smart_charge").is_none());
         let picks = table.get("picks").unwrap().as_table().unwrap();
         assert_eq!(picks.get("ac").unwrap().as_str(), Some("performance"));
         assert_eq!(picks.get("battery").unwrap().as_str(), Some("balanced"));
     }
 
     #[test]
-    fn load_state_empty_and_malformed_give_defaults() {
-        assert_eq!(load_state(""), (None, None));
-        assert_eq!(load_state("smart_charge = = true"), (None, None));
-        assert_eq!(load_state("[picks"), (None, None));
+    fn load_state_empty_and_malformed_give_none() {
+        assert_eq!(load_state(""), None);
+        assert_eq!(load_state("smart_charge = = true"), None);
+        assert_eq!(load_state("[picks"), None);
     }
 
     #[test]
     fn load_state_partial_picks_are_ignored() {
-        assert_eq!(load_state("[picks]\nac = \"quiet\""), (None, None));
-        assert_eq!(load_state("[picks]\nbattery = \"eco\""), (None, None));
-        assert_eq!(load_state("smart_charge = true"), (None, Some(true)));
+        assert_eq!(load_state("[picks]\nac = \"quiet\""), None);
+        assert_eq!(load_state("[picks]\nbattery = \"eco\""), None);
+        assert_eq!(load_state("smart_charge = true"), None);
     }
 
     #[test]
     fn load_state_wrong_types_are_ignored() {
-        assert_eq!(load_state("[picks]\nac = 5\nbattery = true"), (None, None));
-        assert_eq!(load_state("smart_charge = \"yes\""), (None, None));
+        assert_eq!(load_state("[picks]\nac = 5\nbattery = true"), None);
+        assert_eq!(load_state("smart_charge = \"yes\""), None);
     }
 
     #[test]
-    fn load_state_ignores_unknown_keys() {
-        let text = "reapply = true\nsmart_charge = true\n[other]\nkey = 1\n[picks]\nac = \"balanced\"\nbattery = \"eco\"";
-        let (picks, smart_charge) = load_state(text);
+    fn load_state_ignores_unknown_keys_and_legacy_smart_charge() {
+        let text = "reapply = true\nsmart_charge = false\n[other]\nkey = 1\n[picks]\nac = \"balanced\"\nbattery = \"eco\"";
+        let picks = load_state(text);
         assert_eq!(picks, Some(("balanced".to_string(), "eco".to_string())));
-        assert_eq!(smart_charge, Some(true));
     }
 
     #[test]

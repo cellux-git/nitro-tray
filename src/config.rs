@@ -12,8 +12,6 @@ pub const CONFIG_FILE_NAME: &str = "nitro-tray.toml";
 /// Documented config keys and their baked-in defaults.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Config {
-    /// Smart charge (80% charge cap) intent; default `true`.
-    pub smart_charge: bool,
     /// Default AC profile name; default `"balanced"`.
     pub ac_profile: String,
     /// Default battery profile name; default `"eco"`.
@@ -34,7 +32,6 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Config {
-            smart_charge: true,
             ac_profile: "balanced".to_string(),
             battery_profile: "eco".to_string(),
             auto_switch: true,
@@ -69,13 +66,6 @@ pub fn parse(contents: &str) -> (Config, Vec<String>) {
         diagnostics.push("config: malformed TOML: expected a table".to_string());
         return (cfg, diagnostics);
     };
-
-    if let Some(value) = table.get("smart_charge") {
-        match value.as_bool() {
-            Some(b) => cfg.smart_charge = b,
-            None => diagnostics.push(bad_value("smart_charge", "expected boolean", cfg.smart_charge)),
-        }
-    }
 
     if let Some(value) = table.get("ac_profile") {
         match value.as_str() {
@@ -203,8 +193,7 @@ mod tests {
     #[test]
     fn full_file_overrides_everything() {
         let (cfg, diags) = parse(
-            "smart_charge = false\n\
-             ac_profile = \"performance\"\n\
+            "ac_profile = \"performance\"\n\
              battery_profile = \"balanced\"\n\
              auto_switch = false\n\
              reapply = true\n\
@@ -212,7 +201,6 @@ mod tests {
              hotkey = \"ctrl-alt-f\"\n\
              log = true\n",
         );
-        assert!(!cfg.smart_charge);
         assert_eq!(cfg.ac_profile, "performance");
         assert_eq!(cfg.battery_profile, "balanced");
         assert!(!cfg.auto_switch);
@@ -226,8 +214,7 @@ mod tests {
     #[test]
     fn wrong_type_keeps_default_and_diagnostic() {
         let (cfg, diags) = parse(
-            "smart_charge = \"yes\"\n\
-             ac_profile = 42\n\
+            "ac_profile = 42\n\
              battery_profile = true\n\
              auto_switch = 1\n\
              reapply = \"on\"\n\
@@ -236,8 +223,7 @@ mod tests {
              log = \"yes\"\n",
         );
         assert_eq!(cfg, Config::default());
-        assert_eq!(diags.len(), 8);
-        assert!(diags.iter().any(|d| d.contains("'smart_charge'") && d.contains("expected boolean") && d.contains("default true")));
+        assert_eq!(diags.len(), 7);
         assert!(diags.iter().any(|d| d.contains("'ac_profile'") && d.contains("expected string") && d.contains("default \"balanced\"")));
         assert!(diags.iter().any(|d| d.contains("'battery_profile'") && d.contains("expected string") && d.contains("default \"eco\"")));
         assert!(diags.iter().any(|d| d.contains("'auto_switch'") && d.contains("expected boolean") && d.contains("default true")));
@@ -272,10 +258,11 @@ mod tests {
         assert_eq!(diags.len(), 1);
         assert!(diags[0].contains("malformed TOML"));
     }
-
     #[test]
     fn unknown_keys_are_ignored() {
-        let (cfg, diags) = parse("fan_speed = 3\nunknown = \"x\"\n[section]\nkey = 1");
+        // `smart_charge` was removed: smart charge is always on and cannot be
+        // disabled; legacy configs carrying the key must still parse cleanly.
+        let (cfg, diags) = parse("smart_charge = false\nfan_speed = 3\nunknown = \"x\"\n[section]\nkey = 1");
         assert_eq!(cfg, Config::default());
         assert!(diags.is_empty());
     }
@@ -308,12 +295,11 @@ mod tests {
         let dir = temp_dir("load-full");
         std::fs::write(
             dir.join(CONFIG_FILE_NAME),
-            "smart_charge = false\nac_profile = \"performance\"\nbattery_profile = \"balanced\"\nauto_switch = false\nreapply = true\n            reapply_interval_secs = 45\nhotkey = \"ctrl-alt-g\"",
+            "ac_profile = \"performance\"\nbattery_profile = \"balanced\"\nauto_switch = false\nreapply = true\n            reapply_interval_secs = 45\nhotkey = \"ctrl-alt-g\"",
         )
         .unwrap();
         let cfg = load(&dir);
         remove_dir(&dir);
-        assert!(!cfg.smart_charge);
         assert_eq!(cfg.ac_profile, "performance");
         assert_eq!(cfg.battery_profile, "balanced");
         assert!(!cfg.auto_switch);

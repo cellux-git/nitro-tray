@@ -112,21 +112,18 @@ pub struct IntendedState {
     pub hid_mode: HidMode,
     /// Fan behavior is always auto.
     pub fan_auto: bool,
-    /// Smart-charge (80% cap) intent.
-    pub smart_charge: bool,
     /// Target Nitro plan; `None` for firmware-only (reapply) intents.
     pub plan: Option<&'static str>,
 }
 
 /// Pure decision engine. Persistence of picks beyond the session is owned by
-/// the app core (state file); the engine only keeps them in memory. The
-/// smart-charge intent is remembered here so the tray toggle (ticket 10) can
-/// mutate it in place.
+/// the app core (state file); the engine only keeps them in memory. Smart
+/// charge is not a choice: it is always intended on (best effort), so it does
+/// not appear in the engine or the intended state.
 #[derive(Clone, Debug)]
 pub struct PolicyEngine {
     ac_pick: Profile,
     battery_pick: Profile,
-    smart_charge: bool,
 }
 
 impl PolicyEngine {
@@ -136,7 +133,6 @@ impl PolicyEngine {
         PolicyEngine {
             ac_pick: Profile::from_config_str(&config.ac_profile).unwrap_or(Profile::Balanced),
             battery_pick: Profile::from_config_str(&config.battery_profile).unwrap_or(Profile::Eco),
-            smart_charge: config.smart_charge,
         }
     }
 
@@ -181,8 +177,8 @@ impl PolicyEngine {
     }
 
     /// Full intended target for a power state: firmware profile (eco -> 6
-    /// when accepted, else `None`), HID mode, fan auto, smart charge, and the
-    /// matching Nitro plan.
+    /// when accepted, else `None`), HID mode, fan auto, and the matching
+    /// Nitro plan.
     pub fn intended(&self, state: PowerState, eco_accepted: bool) -> IntendedState {
         self.intended_inner(state, eco_accepted, true)
     }
@@ -207,7 +203,6 @@ impl PolicyEngine {
             },
             hid_mode: profile.hid_mode(),
             fan_auto: true,
-            smart_charge: self.smart_charge,
             plan: if include_plan { Some(profile.plan_name()) } else { None },
         }
     }
@@ -317,7 +312,6 @@ mod tests {
                         },
                         hid_mode: hid,
                         fan_auto: true,
-                        smart_charge: true,
                         plan: Some(plan),
                     };
                     assert_eq!(
@@ -337,30 +331,13 @@ mod tests {
         assert_eq!(accepted.firmware_profile, Some(6));
         assert_eq!(accepted.hid_mode, HidMode::Quiet);
         assert!(accepted.fan_auto);
-        assert!(accepted.smart_charge);
         assert_eq!(accepted.plan, Some("Nitro-Eco"));
 
         let rejected = e.intended(PowerState::Battery, false);
         assert_eq!(rejected.firmware_profile, None);
         assert_eq!(rejected.hid_mode, HidMode::Quiet);
         assert!(rejected.fan_auto);
-        assert!(rejected.smart_charge);
         assert_eq!(rejected.plan, Some("Nitro-Eco"));
-    }
-
-    #[test]
-    fn smart_charge_intent_flows_from_config() {
-        for smart_charge in [true, false] {
-            let cfg = Config {
-                smart_charge,
-                ac_profile: "performance".to_string(),
-                ..Config::default()
-            };
-            let e = PolicyEngine::new(&cfg);
-            assert_eq!(e.intended(PowerState::Ac, true).smart_charge, smart_charge);
-            assert_eq!(e.intended(PowerState::Battery, false).smart_charge, smart_charge);
-            assert_eq!(e.reapply_intended(PowerState::Ac, true).smart_charge, smart_charge);
-        }
     }
 
     #[test]
@@ -464,7 +441,6 @@ mod tests {
             firmware_profile: None,
             hid_mode: HidMode::Quiet,
             fan_auto: true,
-            smart_charge: true,
             plan: None,
         };
         assert_eq!(e.reapply_intended(PowerState::Battery, false), want);
