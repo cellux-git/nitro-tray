@@ -12,6 +12,7 @@ pub mod enforcement;
 pub mod hid;
 pub mod hotkey;
 pub mod log;
+pub mod mi;
 pub mod policy;
 pub mod power;
 pub mod power_state;

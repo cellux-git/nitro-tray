@@ -183,9 +183,10 @@ cargo clippy        # lints; the project is clippy-clean
 ### Probe binaries
 
 The build also produces elevated, on-device hardware diagnostic binaries
-(`target\release\probe-wmi.exe`, `probe-hid.exe`, `probe-charge.exe`,
-`probe-power.exe`). Run them **elevated on the target laptop** to verify the
-hardware paths (see [Development](#development)).
+(`target\release\probe_wmi.exe`, `probe_hid.exe`, `probe_charge.exe`,
+`probe_power.exe`, plus `probe_mi.exe` for the MI transport and
+`probe_com_shapes.exe`, the COM-side diagnostic). Run them **elevated on the
+target laptop** to verify the hardware paths (see [Development](#development)).
 
 ### Run the freshly built exe
 
@@ -211,11 +212,15 @@ cargo test
 
 Probe binaries (run **elevated, on-device** for hardware verification):
 
-- `probe-wmi` — Acer WMI platform profile / fan / readback
-- `probe-hid` — Acer HID usage mode
-- `probe-charge` — smart charge toggle / readback
-- `probe-power` — power plan detection / activation / CPU tuning
+- `probe_wmi` — Acer WMI platform profile / fan / readback
+- `probe_hid` — Acer HID usage mode
+- `probe_charge` — smart charge toggle / readback
+- `probe_power` — power plan detection / activation / CPU tuning
+- `probe_mi` — raw `mi.dll` transport diagnostics (BatteryControl rows, write tuples)
+- `probe_com_shapes` — legacy WBEM-COM diagnostic (kept for transport investigations)
 
 Hardware paths (WMI, HID, charge, power APIs) cannot be meaningfully verified
 off-device: on-device verification of these paths is required before relying on
-them.
+them. The WMI/smart-charge adapters run over the in-process MI stack
+(`mi.dll` — the same transport PowerShell's CIM cmdlets use), bound to the
+provider-enumerated instance; no COM, no external process.

@@ -41,7 +41,8 @@ comwbem carries a `# Safety` contract.
 | 13 Reapply | `src/reapply.rs`, timer parts of `src/main.rs` |
 | 14 Docs | `README.md` |
 | 15 WMI recovery | `src/recovery.rs`, readback parts of `src/charge.rs`, reconnect parts of `src/app.rs`, timer parts of `src/main.rs` + `src/tray.rs` |
-| (shared) | `src/comwbem.rs` — owned by nobody/refactor; WMI + charge adapters use it |
+| 16 MI transport | `src/mi.rs`, transport parts of `src/wmi.rs` + `src/charge.rs` |
+| (shared) | `src/comwbem.rs` — owned by nobody; kept since ticket 16 only as the COM-side diagnostic plumbing for `probe_com_shapes` (no adapter uses it anymore) |
 
 `src/main.rs` is extended sequentially (01 -> 08 -> 09 -> 10 -> 12 -> 11 -> 13).
 Each later ticket reads main.rs first and adds its own match arms; keep the

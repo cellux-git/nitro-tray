@@ -18,7 +18,7 @@ use windows_sys::Win32::Devices::HumanInterfaceDevice::{
     HidD_GetAttributes, HidD_GetFeature, HidD_GetHidGuid, HidD_SetFeature, HIDD_ATTRIBUTES,
 };
 use windows_sys::Win32::Foundation::{
-    CloseHandle, GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE,
+    CloseHandle, GetLastError, GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE,
 };
 
 use crate::policy::HidMode;
@@ -28,6 +28,12 @@ pub const ACER_VID: u16 = 0x1025;
 
 /// Feature-report length in bytes (report id byte + 64-byte report).
 const REPORT_LEN: u32 = 65;
+
+/// `HidD_SetFeature` write attempts and delay between them: the first write
+/// right after logon can be rejected while the Acer services initialize the
+/// device (observed on the AN16S-61, 2026-08-07).
+const WRITE_ATTEMPTS: u32 = 4;
+const WRITE_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(750);
 
 /// Device-path marker for the usage-mode collection (lowercase, prior art).
 const DEVICE_PATH_MARKER: &str = "hid#1025174b&col01#";
@@ -155,18 +161,29 @@ impl HidAdapter {
 
     /// Write the usage-mode feature report for the given mode
     /// (`HidD_SetFeature`, 65 bytes; prefix `A0 00 A0 01 00 01 <mode> 00 00`,
-    /// rest zero). Failure is returned as `HidError::Io` — never fatal.
+    /// rest zero). Retried on failure: at logon the Acer services are still
+    /// initializing the device and the first write can be rejected (observed
+    /// transiently on the AN16S-61, 2026-08-07). Failure is returned as
+    /// `HidError::Io` (with the Win32 error code) — never fatal.
     pub fn set_usage_mode(&self, mode: HidMode) -> Result<(), HidError> {
         let mut buf = [0u8; REPORT_LEN as usize];
         buf[..9].copy_from_slice(&usage_mode_report(mode));
-        let ok = unsafe { HidD_SetFeature(self.handle, buf.as_ptr().cast(), REPORT_LEN) };
-        if ok {
-            Ok(())
-        } else {
-            Err(HidError::Io {
-                message: format!("HidD_SetFeature failed for {mode:?} on {}", self.path),
-            })
+        for attempt in 0..WRITE_ATTEMPTS {
+            let ok = unsafe { HidD_SetFeature(self.handle, buf.as_ptr().cast(), REPORT_LEN) };
+            if ok {
+                return Ok(());
+            }
+            if attempt + 1 < WRITE_ATTEMPTS {
+                std::thread::sleep(WRITE_RETRY_DELAY);
+            }
         }
+        Err(HidError::Io {
+            message: format!(
+                "HidD_SetFeature failed for {mode:?} on {} (Win32 error {})",
+                self.path,
+                unsafe { GetLastError() }
+            ),
+        })
     }
 
     /// Best-effort usage-mode readback. The device protocol exposes NO

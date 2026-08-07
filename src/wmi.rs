@@ -1,20 +1,19 @@
-//! In-process raw COM/WMI control of the Acer gaming firmware
+//! In-process MI control of the Acer gaming firmware
 //! (`AcerGamingFunction` in `ROOT\WMI`, instance `ACPI\PNP0C14\APGe_0`).
 //! Opcode/method encodings match the proven AeroForge tables (see
 //! `.scratch/nitro-tray/prior-art-aeroforge.md`). No PowerShell/CIM fallback
-//! exists — everything is raw COM `ExecMethod` via the shared `comwbem`
-//! module.
+//! exists — everything is raw in-process MI (`mi.dll`) via the shared `mi`
+//! module, bound to the provider-enumerated instance (the `-InputObject`
+//! shape; class-level invocation is rejected by this provider, ticket 16).
 
 use std::cell::Cell;
 
-use crate::comwbem::{self, Bstr, ClassObject, ComApartment, ComRef, Variant, CIM_UINT32, CIM_UINT64};
 use crate::log;
-use windows_sys::Win32::Foundation::REGDB_E_CLASSNOTREG;
-use windows_sys::Win32::System::Wmi::{WBEM_E_INVALID_CLASS, WBEM_E_NOT_FOUND};
+use crate::mi::{MiConnection, MiInstance, MiError, MI_RESULT_ACCESS_DENIED, MI_RESULT_INVALID_CLASS, MI_RESULT_NOT_FOUND};
 
 /// Consecutive WMI failures after which the adapter disables itself: a
-/// flapping/starving provider can destabilize in-proc WbemCore to the point
-/// of access violations, so repeated failures must stop all further calls.
+/// flapping/starving provider must stop all further calls rather than keep
+/// hammering a broken transport (the recovery loop reconnects the adapter).
 const MAX_ADAPTER_FAILURES: u32 = 5;
 
 /// Acer firmware platform profile values (prior art, spec-confirmed).
@@ -33,9 +32,10 @@ pub const FAN_AUTO: u32 = 0x0041_0009;
 /// Errors from the WMI layer.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WmiError {
-    /// A COM/WMI call failed.
+    /// An MI/WMI call failed (hr carries the `MI_RESULT` code).
     Com { hr: i32, op: &'static str },
-    /// The Acer WMI instance/class was not found (interface unavailable).
+    /// The Acer WMI instance/class was not found or is not accessible
+    /// (interface unavailable).
     NotAvailable,
     /// An unexpected response shape.
     Unexpected(String),
@@ -72,55 +72,31 @@ pub fn decode_gm_output_byte(value: u64) -> u8 {
 
 const NAMESPACE: &str = "ROOT\\WMI";
 const CLASS_NAME: &str = "AcerGamingFunction";
-const INSTANCE_PATH: &str = "AcerGamingFunction.InstanceName=\"ACPI\\PNP0C14\\APGe_0\"";
 const IN_PARAM: &str = "gmInput";
 const OUT_PARAM: &str = "gmOutput";
 
 pub struct WmiAdapter {
-    services: ComRef,
-    class: ClassObject,
-    /// Dropped LAST: CoUninitialize must follow the Release of every COM
-    /// object, so this field is declared after the interface handles.
-    _com: ComApartment,
+    connection: MiConnection,
     /// Consecutive failed calls; disables the adapter at `MAX_ADAPTER_FAILURES`.
     failures: Cell<u32>,
     /// When set, every call short-circuits to `NotAvailable`.
     dead: Cell<bool>,
 }
 
-// COM objects are apartment-bound; the adapter is only ever used from the
-// thread that created it (the UI thread), and the markers only relax
-// thread-safety claims for the single-threaded core that holds it.
+// MI is thread-safe, and the markers relax thread-safety claims for the
+// single-threaded core that holds the adapter (COM no longer involved).
 unsafe impl Send for WmiAdapter {}
 unsafe impl Sync for WmiAdapter {}
 
 impl WmiAdapter {
-    /// Connect to `ROOT\WMI` in-process (CoInitializeEx + CoCreateInstance
-    /// CLSID_WbemLocator + ConnectServer). Fails with `NotAvailable` when the
-    /// Acer WMI interface is unreachable.
+    /// Connect to `ROOT\WMI` via in-process MI (`mi.dll`): initializes the MI
+    /// client and a local session. Session creation does not talk to the
+    /// provider, so reachability is proven by the first operation; failures
+    /// trip the circuit breaker and the recovery loop reconnects.
     pub fn connect() -> Result<Self, WmiError> {
-        let _com = ComApartment::init().map_err(|hr| WmiError::Com { hr, op: "CoInitializeEx" })?;
-        let locator =
-            unsafe { comwbem::create_locator() }.map_err(|hr| {
-                if hr == REGDB_E_CLASSNOTREG {
-                    WmiError::NotAvailable
-                } else {
-                    WmiError::Com { hr, op: "CoCreateInstance(CLSID_WbemLocator)" }
-                }
-            })?;
-        let services = unsafe { comwbem::connect_server(&locator, NAMESPACE) }
-            .map_err(|hr| WmiError::Com { hr, op: "ConnectServer(ROOT\\WMI)" })?;
-        let class = unsafe { comwbem::get_class(&services, CLASS_NAME) }.map_err(|hr| {
-            if hr == WBEM_E_INVALID_CLASS || hr == WBEM_E_NOT_FOUND {
-                WmiError::NotAvailable
-            } else {
-                WmiError::Com { hr, op: "GetObject(AcerGamingFunction)" }
-            }
-        })?;
+        let connection = MiConnection::connect().map_err(map_mi)?;
         Ok(Self {
-            _com,
-            services,
-            class,
+            connection,
             failures: Cell::new(0),
             dead: Cell::new(false),
         })
@@ -179,78 +155,46 @@ impl WmiAdapter {
         result
     }
 
+    /// One instance-bound MI invocation: enumerate the provider's first
+    /// `AcerGamingFunction` instance (the binding target — the same shape
+    /// PowerShell's `Invoke-CimMethod -InputObject` uses), build the input
+    /// bag (`gmInput`, typed as declared by the MOF: `MI_UINT64` on Set*
+    /// methods, `MI_UINT32` on Get* methods), invoke, read `gmOutput`.
     fn exec_method_inner(&self, method: &'static str, input: u64) -> Result<Option<u64>, WmiError> {
-        unsafe {
-            let method_wide = comwbem::wide(method);
-            let mut in_signature: *mut core::ffi::c_void = core::ptr::null_mut();
-            let mut out_signature: *mut core::ffi::c_void = core::ptr::null_mut();
-            let hr = self
-                .class
-                .get_method(method_wide.as_ptr(), &mut in_signature, &mut out_signature);
-            if hr != 0 {
-                return Err(self.hr_error(hr, "GetMethod"));
-            }
-            drop(ComRef::from_raw(out_signature));
-            if in_signature.is_null() {
-                return Err(WmiError::Unexpected(format!("{method}: no input signature")));
-            }
-            let in_signature = ClassObject::from_raw(in_signature);
-
-            let mut in_params: *mut core::ffi::c_void = core::ptr::null_mut();
-            let hr = in_signature.spawn_instance(&mut in_params);
-            if hr != 0 {
-                return Err(self.hr_error(hr, "SpawnInstance"));
-            }
-            if in_params.is_null() {
-                return Err(WmiError::Unexpected(format!("{method}: null input instance")));
-            }
-            let in_params = ClassObject::from_raw(in_params);
-
-            let in_param_wide = comwbem::wide(IN_PARAM);
-            // The Acer MOF declares gmInput as UInt64 on Set* methods and
-            // UInt32 on Get* methods, and WMI rejects a type mismatch without
-            // coercion, so try both in order (verified against the class
-            // definition; the BSTR form stays as a last resort for odd SKUs).
-            let ui8 = Variant::ui8(input);
-            let hr = in_params.put(in_param_wide.as_ptr(), &ui8, CIM_UINT64);
-            if hr != 0 {
-                let ui4 = Variant::ui4(input as u32);
-                let hr = in_params.put(in_param_wide.as_ptr(), &ui4, CIM_UINT32);
-                if hr != 0 {
-                    let text = input.to_string();
-                    let bstr = Bstr::new(&text)
-                        .ok_or_else(|| WmiError::Unexpected("SysAllocString(gmInput) failed".into()))?;
-                    let u64_bstr = Variant::from_bstr(bstr.into_raw());
-                    let hr = in_params.put(in_param_wide.as_ptr(), &u64_bstr, CIM_UINT64);
-                    if hr != 0 {
-                        return Err(self.hr_error(hr, "Put(gmInput)"));
-                    }
-                }
-            }
-
-            let path = Bstr::new(INSTANCE_PATH)
-                .ok_or_else(|| WmiError::Unexpected("SysAllocString(instance path) failed".into()))?;
-            let method_bstr =
-                Bstr::new(method).ok_or_else(|| WmiError::Unexpected("SysAllocString(method) failed".into()))?;
-            let out_params = comwbem::exec_method(&self.services, &path, &method_bstr, in_params.raw())
-                .map_err(|hr| self.hr_error(hr, method))?;
-            match out_params {
-                None => Ok(None),
-                Some(out) => {
-                    let out_param_wide = comwbem::wide(OUT_PARAM);
-                    let value = out.get(out_param_wide.as_ptr()).map_err(|hr| self.hr_error(hr, "Get(gmOutput)"))?;
-                    Ok(value.as_u64())
-                }
+        let instance = self.enumerate_instance()?;
+        let mut input_bag = self.connection.new_instance(CLASS_NAME).map_err(map_mi)?;
+        if method.starts_with("Set") {
+            input_bag.add_u64(IN_PARAM, input).map_err(map_mi)?;
+        } else {
+            input_bag.add_u32(IN_PARAM, input as u32).map_err(map_mi)?;
+        }
+        let out = self.connection.invoke(NAMESPACE, &instance, method, &input_bag).map_err(map_mi)?;
+        match out {
+            None => Ok(None),
+            Some(result) => {
+                let value = result
+                    .get_u64(OUT_PARAM)
+                    .map_err(map_mi)?
+                    .ok_or_else(|| WmiError::Unexpected(format!("{method}: no gmOutput")))?;
+                Ok(Some(value))
             }
         }
     }
 
-    fn hr_error(&self, hr: i32, op: &'static str) -> WmiError {
-        if hr == WBEM_E_NOT_FOUND {
-            WmiError::Unexpected(format!("{op}: WBEM_E_NOT_FOUND"))
-        } else {
-            WmiError::Com { hr, op }
-        }
+    /// The provider's first `AcerGamingFunction` instance. Re-enumerated per
+    /// call so a provider registration hiccup self-heals on the next call
+    /// (MI is not subject to the WBEM-COM bad windows, ticket 16).
+    fn enumerate_instance(&self) -> Result<MiInstance, WmiError> {
+        self.connection.enumerate_first_instance(NAMESPACE, CLASS_NAME).map_err(map_mi)
+    }
+}
+
+/// Maps an `MiError` to `WmiError`: interface-unavailable codes become
+/// `NotAvailable` (the caller degrades), everything else is `Com`.
+fn map_mi(err: MiError) -> WmiError {
+    match err.result {
+        MI_RESULT_INVALID_CLASS | MI_RESULT_NOT_FOUND | MI_RESULT_ACCESS_DENIED => WmiError::NotAvailable,
+        _ => WmiError::Com { hr: err.result, op: err.op },
     }
 }
 
@@ -299,5 +243,23 @@ mod tests {
         assert_eq!(PROFILE_ECO, 6);
         assert_eq!(FAN_AUTO, 0x0041_0009);
         assert_eq!(SETTING_PLATFORM_PROFILE, 0x0B);
+    }
+
+    #[test]
+    fn mi_interface_unavailable_codes_map_to_not_available() {
+        let err = MiError { result: MI_RESULT_INVALID_CLASS, op: "t", message: None };
+        assert_eq!(map_mi(err), WmiError::NotAvailable);
+        let err = MiError { result: MI_RESULT_NOT_FOUND, op: "t", message: None };
+        assert_eq!(map_mi(err), WmiError::NotAvailable);
+        let err = MiError { result: MI_RESULT_ACCESS_DENIED, op: "t", message: None };
+        assert_eq!(map_mi(err), WmiError::NotAvailable);
+    }
+
+    #[test]
+    fn other_mi_codes_map_to_com() {
+        let err = MiError { result: crate::mi::MI_RESULT_TYPE_MISMATCH, op: "MI_Instance_SetElement", message: None };
+        assert_eq!(map_mi(err), WmiError::Com { hr: 13, op: "MI_Instance_SetElement" });
+        let err = MiError { result: crate::mi::MI_RESULT_INVALID_NAMESPACE, op: "t", message: None };
+        assert_eq!(map_mi(err), WmiError::Com { hr: 3, op: "t" });
     }
 }

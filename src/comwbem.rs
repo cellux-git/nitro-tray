@@ -336,6 +336,26 @@ impl Variant {
         }
     }
 
+    pub fn i4(value: i32) -> Self {
+        Self {
+            vt: VT_I4,
+            _w_reserved1: 0,
+            _w_reserved2: 0,
+            _w_reserved3: 0,
+            data: VariantData { l_val: value },
+        }
+    }
+
+    pub fn i8(value: i64) -> Self {
+        Self {
+            vt: VT_I8,
+            _w_reserved1: 0,
+            _w_reserved2: 0,
+            _w_reserved3: 0,
+            data: VariantData { ll_val: value },
+        }
+    }
+
     /// Takes ownership of the given BSTR.
     pub fn from_bstr(bstr: BSTR) -> Self {
         Self {
