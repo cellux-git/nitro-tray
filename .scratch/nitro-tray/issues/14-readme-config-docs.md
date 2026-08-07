@@ -6,7 +6,7 @@
 
 **Status:** ready-for-agent
 
-- [ ] README states the config filename and its location (beside the exe).
-- [ ] README documents all config keys with defaults (smart charge, AC profile, battery profile, auto-switch, reapply, reapply interval, hotkey) and that config is read at startup.
-- [ ] README documents the CLI flags (`--log`, `--uninstall`).
-- [ ] README explains that no config file is required.
+- [x] README states the config filename and its location (beside the exe).
+- [x] README documents all config keys with defaults (smart charge, AC profile, battery profile, auto-switch, reapply, reapply interval, hotkey) and that config is read at startup.
+- [x] README documents the CLI flags (`--log`, `--uninstall`).
+- [x] README explains that no config file is required.
