@@ -46,6 +46,18 @@ fn main() {
     }
     log::info("nitro-tray starting");
 
+    // Route panics into the log (with a backtrace) instead of dying silently
+    // on stderr, which is invisible for a GUI-subsystem app.
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        log::error(format!("PANIC: {info}"));
+        let backtrace = std::backtrace::Backtrace::capture();
+        if backtrace.status() == std::backtrace::BacktraceStatus::Captured {
+            log::error(format!("backtrace:\n{backtrace}"));
+        }
+        default_hook(info);
+    }));
+
     if uninstall {
         log::info("uninstall requested");
         match task::uninstall_logon_task() {
@@ -62,14 +74,19 @@ fn main() {
             return;
         }
     };
+    log::info("single-instance mutex acquired");
 
     let config = config::load(&exe_dir);
+    log::info("config loaded");
     let hotkey_spec = config.hotkey.clone();
     let reapply_cfg = config.clone();
     let mut app = AppCore::new(config, &exe_dir);
+    log::info("app core initialized");
 
     if let Err(e) = task::install_logon_task(&exe_path) {
         log::warn(format!("failed to install logon task: {e:?}"));
+    } else {
+        log::info("logon task installed");
     }
 
     let (event_tx, event_rx) = mpsc::channel();
@@ -77,14 +94,17 @@ fn main() {
         Ok(tray) => tray,
         Err(e) => {
             log::error(format!("failed to create tray: {e:?}"));
+            fatal(format!("failed to create tray: {e:?}"));
             return;
         }
     };
+    log::info("tray created");
 
     let view = view_from(&app);
     if let Err(e) = tray.update(&view) {
         log::warn(format!("failed to update tray view: {e:?}"));
     }
+    log::info("tray view updated");
 
     // Kept alive for the process lifetime; `Drop` unregisters the hotkey.
     let _hotkey = match Hotkey::register(tray.hwnd(), &hotkey_spec) {
@@ -109,8 +129,23 @@ fn main() {
     enforcement::on_startup(&mut app);
     log::info("startup enforcement complete");
 
+    log::info("entering message pump");
     message_pump(&tray, &mut app, &event_rx);
     log::info("nitro-tray exiting");
+}
+
+/// Show a message box for a fatal startup error (the GUI-subsystem app has no
+/// console, so a silent `return` otherwise looks like the app just vanishes).
+fn fatal(message: String) {
+    let wide: Vec<u16> = message.encode_utf16().chain(std::iter::once(0)).collect();
+    unsafe {
+        windows_sys::Win32::UI::WindowsAndMessaging::MessageBoxW(
+            std::ptr::null_mut(),
+            wide.as_ptr(),
+            w!("Nitro Tray"),
+            0x10, // MB_ICONERROR
+        );
+    }
 }
 
 /// Full path of the running executable via `GetModuleFileNameW`.

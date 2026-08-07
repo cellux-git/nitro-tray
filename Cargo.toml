@@ -41,3 +41,8 @@ windows-sys = { version = "0.61", features = [
 
 [build-dependencies]
 embed-manifest = "1"
+
+[profile.release]
+# Line tables only: near-zero size/speed cost, but panic backtraces in the log
+# carry file/line info instead of bare addresses.
+debug = "line-tables-only"

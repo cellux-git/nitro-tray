@@ -5,9 +5,9 @@
 //! exists — everything is raw COM `ExecMethod` via the shared `comwbem`
 //! module.
 
-use crate::comwbem::{self, Bstr, ClassObject, ComApartment, ComRef, Variant};
+use crate::comwbem::{self, Bstr, ClassObject, ComApartment, ComRef, Variant, CIM_UINT32, CIM_UINT64};
 use windows_sys::Win32::Foundation::REGDB_E_CLASSNOTREG;
-use windows_sys::Win32::System::Wmi::{CIM_UINT32, CIM_UINT64, WBEM_E_INVALID_CLASS, WBEM_E_NOT_FOUND};
+use windows_sys::Win32::System::Wmi::{WBEM_E_INVALID_CLASS, WBEM_E_NOT_FOUND};
 
 /// Acer firmware platform profile values (prior art, spec-confirmed).
 pub const PROFILE_QUIET: u32 = 0;
@@ -163,17 +163,24 @@ impl WmiAdapter {
             let in_params = ClassObject::from_raw(in_params);
 
             let in_param_wide = comwbem::wide(IN_PARAM);
-            let ui4 = Variant::ui4(input as u32);
-            let hr = in_params.put(in_param_wide.as_ptr(), &ui4, CIM_UINT32);
+            // The Acer MOF declares gmInput as UInt64 on Set* methods and
+            // UInt32 on Get* methods, and WMI rejects a type mismatch without
+            // coercion, so try both in order (verified against the class
+            // definition; the BSTR form stays as a last resort for odd SKUs).
+            let ui8 = Variant::ui8(input);
+            let hr = in_params.put(in_param_wide.as_ptr(), &ui8, CIM_UINT64);
             if hr != 0 {
-                // Larger inputs are encoded as a decimal string (prior art).
-                let text = input.to_string();
-                let bstr = Bstr::new(&text)
-                    .ok_or_else(|| WmiError::Unexpected("SysAllocString(gmInput) failed".into()))?;
-                let u64_bstr = Variant::from_bstr(bstr.into_raw());
-                let hr = in_params.put(in_param_wide.as_ptr(), &u64_bstr, CIM_UINT64);
+                let ui4 = Variant::ui4(input as u32);
+                let hr = in_params.put(in_param_wide.as_ptr(), &ui4, CIM_UINT32);
                 if hr != 0 {
-                    return Err(self.hr_error(hr, "Put(gmInput)"));
+                    let text = input.to_string();
+                    let bstr = Bstr::new(&text)
+                        .ok_or_else(|| WmiError::Unexpected("SysAllocString(gmInput) failed".into()))?;
+                    let u64_bstr = Variant::from_bstr(bstr.into_raw());
+                    let hr = in_params.put(in_param_wide.as_ptr(), &u64_bstr, CIM_UINT64);
+                    if hr != 0 {
+                        return Err(self.hr_error(hr, "Put(gmInput)"));
+                    }
                 }
             }
 

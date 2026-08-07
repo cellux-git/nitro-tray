@@ -6,9 +6,9 @@
 
 use std::time::Duration;
 
-use windows_sys::Win32::System::Wmi::{CIM_UINT8, WBEM_E_NOT_FOUND};
+use windows_sys::Win32::System::Wmi::WBEM_E_NOT_FOUND;
 
-use crate::comwbem::{self, Bstr, ClassObject, ComApartment, ComRef, Variant};
+use crate::comwbem::{self, Bstr, ClassObject, ComApartment, ComRef, Variant, CIM_UINT8};
 
 /// Errors from the smart-charge WMI layer.
 #[derive(Clone, Debug, PartialEq, Eq)]

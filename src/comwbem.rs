@@ -42,6 +42,23 @@ pub const VT_I8: u16 = 20;
 pub const VT_UI8: u16 = 21;
 pub const VT_ARRAY: u16 = 0x2000;
 
+// Real wbemcli.h CIMTYPE values. windows-sys 0.61 generates the CIM_*
+// constants from the oleaut VARENUM values instead (CIM_SINT16=2,
+// CIM_UINT32=19, CIM_UINT64=21, ...), which WMI rejects with
+// WBEM_E_INVALID_PARAMETER; the canonical wbemcli.h values are used here.
+pub const CIM_BOOLEAN: i32 = 11;
+pub const CIM_STRING: i32 = 8;
+pub const CIM_OBJECT: i32 = 13;
+pub const CIM_SINT8: i32 = 16;
+pub const CIM_UINT8: i32 = 17;
+pub const CIM_SINT16: i32 = 18;
+pub const CIM_UINT16: i32 = 19;
+pub const CIM_SINT32: i32 = 20;
+pub const CIM_UINT32: i32 = 21;
+pub const CIM_SINT64: i32 = 22;
+pub const CIM_UINT64: i32 = 23;
+pub const CIM_FLAG_ARRAY: i32 = 0x2000;
+
 const RPC_C_AUTHN_WINNT: u32 = 10;
 const RPC_C_AUTHZ_NONE: u32 = 0;
 
@@ -291,6 +308,16 @@ impl Variant {
         }
     }
 
+    pub fn ui8(value: u64) -> Self {
+        Self {
+            vt: VT_UI8,
+            _w_reserved1: 0,
+            _w_reserved2: 0,
+            _w_reserved3: 0,
+            data: VariantData { ull_val: value },
+        }
+    }
+
     /// Takes ownership of the given BSTR.
     pub fn from_bstr(bstr: BSTR) -> Self {
         Self {
@@ -478,8 +505,9 @@ impl ClassObject {
         out_signature: *mut *mut c_void,
     ) -> HRESULT {
         unsafe {
-            let vtbl = self.0.raw() as *const IWbemClassObject_Vtbl;
-            ((*vtbl).get_method)(self.0.raw(), name, 0, in_signature, out_signature)
+            let object = self.0.raw();
+            let vtbl = *(object as *const *const IWbemClassObject_Vtbl);
+            ((*vtbl).get_method)(object, name, 0, in_signature, out_signature)
         }
     }
 
@@ -487,8 +515,9 @@ impl ClassObject {
     /// `instance` must point to writable storage the caller owns.
     pub unsafe fn spawn_instance(&self, instance: *mut *mut c_void) -> HRESULT {
         unsafe {
-            let vtbl = self.0.raw() as *const IWbemClassObject_Vtbl;
-            ((*vtbl).spawn_instance)(self.0.raw(), 0, instance)
+            let object = self.0.raw();
+            let vtbl = *(object as *const *const IWbemClassObject_Vtbl);
+            ((*vtbl).spawn_instance)(object, 0, instance)
         }
     }
 
@@ -497,8 +526,9 @@ impl ClassObject {
     /// live `Variant` for the duration of the call.
     pub unsafe fn put(&self, name: PCWSTR, value: &Variant, cim_type: CIMTYPE_ENUMERATION) -> HRESULT {
         unsafe {
-            let vtbl = self.0.raw() as *const IWbemClassObject_Vtbl;
-            ((*vtbl).put)(self.0.raw(), name, 0, value, cim_type)
+            let object = self.0.raw();
+            let vtbl = *(object as *const *const IWbemClassObject_Vtbl);
+            ((*vtbl).put)(object, name, 0, value, cim_type)
         }
     }
 
@@ -509,9 +539,10 @@ impl ClassObject {
     /// `name` must be a valid NUL-terminated wide string.
     pub unsafe fn get(&self, name: PCWSTR) -> Result<Variant, HRESULT> {
         unsafe {
-            let vtbl = self.0.raw() as *const IWbemClassObject_Vtbl;
+            let object = self.0.raw();
+            let vtbl = *(object as *const *const IWbemClassObject_Vtbl);
             let mut value = Variant::empty();
-            let hr = ((*vtbl).get)(self.0.raw(), name, 0, &mut value, null_mut(), null_mut());
+            let hr = ((*vtbl).get)(object, name, 0, &mut value, null_mut(), null_mut());
             if hr != 0 {
                 return Err(hr);
             }
@@ -559,10 +590,11 @@ pub unsafe fn create_locator() -> Result<ComRef, HRESULT> {
 pub unsafe fn connect_server(locator: &ComRef, namespace: &str) -> Result<ComRef, HRESULT> {
     unsafe {
         let ns = Bstr::new(namespace).ok_or(windows_sys::Win32::Foundation::E_OUTOFMEMORY)?;
-        let vtbl = locator.raw() as *const IWbemLocator_Vtbl;
+        let object = locator.raw();
+        let vtbl = *(object as *const *const IWbemLocator_Vtbl);
         let mut services: *mut c_void = null_mut();
         let hr = ((*vtbl).connect_server)(
-            locator.raw(),
+            object,
             ns.raw(),
             null(),
             null(),
@@ -604,17 +636,18 @@ pub unsafe fn connect_server(locator: &ComRef, namespace: &str) -> Result<ComRef
 pub unsafe fn get_class(services: &ComRef, class: &str) -> Result<ClassObject, HRESULT> {
     unsafe {
         let name = Bstr::new(class).ok_or(windows_sys::Win32::Foundation::E_OUTOFMEMORY)?;
-        let vtbl = services.raw() as *const IWbemServices_Vtbl;
-        let mut object: *mut c_void = null_mut();
-        let hr = ((*vtbl).get_object)(services.raw(), name.raw(), 0, null_mut(), &mut object, null_mut());
+        let object = services.raw();
+        let vtbl = *(object as *const *const IWbemServices_Vtbl);
+        let mut class_object: *mut c_void = null_mut();
+        let hr = ((*vtbl).get_object)(object, name.raw(), 0, null_mut(), &mut class_object, null_mut());
         drop(name);
         if hr != 0 {
             return Err(hr);
         }
-        if object.is_null() {
+        if class_object.is_null() {
             return Err(windows_sys::Win32::Foundation::E_FAIL);
         }
-        Ok(ClassObject::from_raw(object))
+        Ok(ClassObject::from_raw(class_object))
     }
 }
 
@@ -626,18 +659,20 @@ pub unsafe fn get_class(services: &ComRef, class: &str) -> Result<ClassObject, H
 pub unsafe fn first_instance_path(services: &ComRef, class: &str) -> Result<Bstr, HRESULT> {
     unsafe {
         let name = Bstr::new(class).ok_or(E_OUTOFMEMORY)?;
-        let vtbl = services.raw() as *const IWbemServices_Vtbl;
+        let object = services.raw();
+        let vtbl = *(object as *const *const IWbemServices_Vtbl);
         let mut enumerator: *mut c_void = null_mut();
-        let hr = ((*vtbl).create_instance_enum)(services.raw(), name.raw(), 0, null_mut(), &mut enumerator);
+        let hr = ((*vtbl).create_instance_enum)(object, name.raw(), 0, null_mut(), &mut enumerator);
         drop(name);
         if hr != 0 {
             return Err(hr);
         }
         let enumerator = ComRef::from_raw(enumerator);
-        let enum_vtbl = enumerator.raw() as *const IEnumWbemClassObject_Vtbl;
+        let enum_object = enumerator.raw();
+        let enum_vtbl = *(enum_object as *const *const IEnumWbemClassObject_Vtbl);
         let mut instance: *mut c_void = null_mut();
         let mut returned: u32 = 0;
-        let hr = ((*enum_vtbl).next)(enumerator.raw(), 0, 1, &mut instance, &mut returned);
+        let hr = ((*enum_vtbl).next)(enum_object, 0, 1, &mut instance, &mut returned);
         if hr != 0 {
             return Err(hr);
         }
@@ -696,10 +731,11 @@ pub unsafe fn exec_method(
     in_params: *mut c_void,
 ) -> Result<Option<ClassObject>, HRESULT> {
     unsafe {
-        let vtbl = services.raw() as *const IWbemServices_Vtbl;
+        let object = services.raw();
+        let vtbl = *(object as *const *const IWbemServices_Vtbl);
         let mut out_params: *mut c_void = null_mut();
         let hr = ((*vtbl).exec_method)(
-            services.raw(),
+            object,
             object_path.raw(),
             method.raw(),
             0,

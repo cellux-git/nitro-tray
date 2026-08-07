@@ -16,7 +16,8 @@ use windows_sys::Win32::Foundation::{
     GetLastError, HANDLE, HWND, LPARAM, LRESULT, POINT, WPARAM, ERROR_CLASS_ALREADY_EXISTS,
 };
 use windows_sys::Win32::Graphics::Gdi::{
-    CreateDIBSection, DeleteObject, BI_RGB, BITMAPINFO, BITMAPINFOHEADER, DIB_RGB_COLORS, HBITMAP,
+    CreateBitmap, CreateDIBSection, DeleteObject, BI_RGB, BITMAPINFO, BITMAPINFOHEADER,
+    DIB_RGB_COLORS, HBITMAP,
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::Power::{
@@ -136,6 +137,8 @@ pub struct Tray {
     icon: HICON,
     /// Kept for the icon's lifetime; freed in `Drop` after `DestroyIcon`.
     bitmap: HBITMAP,
+    /// Monochrome mask handed to `CreateIconIndirect`; freed like `bitmap`.
+    mask: HBITMAP,
     power_notify: HPOWERNOTIFY,
     state: Box<TrayState>,
 }
@@ -190,13 +193,13 @@ impl Tray {
             });
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, &*state as *const TrayState as isize);
 
-            let Some((icon, bitmap)) = make_battery_icon() else {
+            let Some((icon, bitmap, mask)) = make_battery_icon() else {
                 destroy_window(hwnd);
                 return Err(TrayError::Create("icon creation failed"));
             };
             let nid = nid_template(hwnd, icon);
             if Shell_NotifyIconW(NIM_ADD, &nid) == 0 {
-                destroy_icon_assets(icon, bitmap);
+                destroy_icon_assets(icon, bitmap, mask);
                 destroy_window(hwnd);
                 return Err(TrayError::Create("Shell_NotifyIconW NIM_ADD failed"));
             }
@@ -204,7 +207,7 @@ impl Tray {
             if SetTimer(hwnd, POLL_TIMER_ID, power_state::SLOW_POLL_MS, None) == 0 {
                 let nid = nid_template(hwnd, ptr::null_mut());
                 let _ = Shell_NotifyIconW(NIM_DELETE, &nid);
-                destroy_icon_assets(icon, bitmap);
+                destroy_icon_assets(icon, bitmap, mask);
                 destroy_window(hwnd);
                 return Err(TrayError::Create("SetTimer failed"));
             }
@@ -222,6 +225,7 @@ impl Tray {
                 hwnd,
                 icon,
                 bitmap,
+                mask,
                 power_notify,
                 state,
             })
@@ -289,7 +293,7 @@ impl Drop for Tray {
             }
             KillTimer(self.hwnd, POLL_TIMER_ID);
             destroy_window(self.hwnd);
-            destroy_icon_assets(self.icon, self.bitmap);
+            destroy_icon_assets(self.icon, self.bitmap, self.mask);
         }
     }
 }
@@ -534,10 +538,11 @@ pub fn tooltip_text(view: &TrayView) -> String {
     )
 }
 
-/// 16x16 battery glyph drawn into a 32bpp top-down DIB: dark outline, green
-/// fill with a brighter charge half, and a terminal nub. The bitmap handle is
-/// kept alive by the caller for the icon's lifetime.
-fn make_battery_icon() -> Option<(HICON, HBITMAP)> {
+/// 16x16 battery glyph drawn into a 32bpp top-down DIB, plus a monochrome
+/// mask bitmap: `CreateIconIndirect` on this Windows version rejects a NULL
+/// mask even for 32bpp+alpha color icons. Both bitmap handles are kept alive
+/// by the caller for the icon's lifetime.
+fn make_battery_icon() -> Option<(HICON, HBITMAP, HBITMAP)> {
     unsafe {
         let mut bmi = BITMAPINFO::default();
         bmi.bmiHeader.biSize = size_of::<BITMAPINFOHEADER>() as u32;
@@ -563,19 +568,26 @@ fn make_battery_icon() -> Option<(HICON, HBITMAP)> {
             std::slice::from_raw_parts_mut(bits as *mut u32, (ICON_SIZE * ICON_SIZE) as usize);
         draw_battery_pixels(pixels, ICON_SIZE as usize);
 
+        let mask = CreateBitmap(ICON_SIZE, ICON_SIZE, 1, 1, ptr::null());
+        if mask.is_null() {
+            DeleteObject(bitmap as _);
+            return None;
+        }
+
         let info = ICONINFO {
             fIcon: 1,
             xHotspot: 0,
             yHotspot: 0,
-            hbmMask: ptr::null_mut(),
+            hbmMask: mask,
             hbmColor: bitmap,
         };
         let icon = CreateIconIndirect(&info);
         if icon.is_null() {
             DeleteObject(bitmap as _);
+            DeleteObject(mask as _);
             return None;
         }
-        Some((icon, bitmap))
+        Some((icon, bitmap, mask))
     }
 }
 
@@ -613,11 +625,14 @@ fn destroy_window(hwnd: HWND) {
     }
 }
 
-fn destroy_icon_assets(icon: HICON, bitmap: HBITMAP) {
+fn destroy_icon_assets(icon: HICON, bitmap: HBITMAP, mask: HBITMAP) {
     unsafe {
         DestroyIcon(icon);
         if !bitmap.is_null() {
             DeleteObject(bitmap as _);
+        }
+        if !mask.is_null() {
+            DeleteObject(mask as _);
         }
     }
 }
