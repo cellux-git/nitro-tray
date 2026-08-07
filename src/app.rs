@@ -252,7 +252,7 @@ impl AppCore {
 
     /// Acer WMI interface reachable?
     pub fn wmi_available(&self) -> bool {
-        self.wmi.is_some()
+        self.wmi.as_ref().is_some_and(|wmi| wmi.is_available())
     }
 
     /// Eco entry disabled (firmware rejected profile 6)?
