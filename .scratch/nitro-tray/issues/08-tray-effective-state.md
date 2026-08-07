@@ -65,3 +65,7 @@ when `RegisterPowerSettingNotification` is unavailable).
 ## Comments (code review)
 
 2026-08-07: Review fixes: (1) PowerChanged is now gated on the AC/battery STATE changing, never on battery-percent drift (manual plan edits are no longer clobbered by the 10s poll); (2) TrayView gains eco_disabled (eco entry greyed, not removed) and plans (degraded-mode 'Windows plan' section, enabled); TrayEvent gains SelectPlan. Menu visual verification remains on-device.
+
+## Comments (debug session 2026-08-07)
+
+CreateIconIndirect fails (NULL) with a 32bpp+alpha color DIB and a NULL hbmMask on Windows 10/11 - the monochrome mask bitmap is required in practice. make_battery_icon now creates a 1bpp CreateBitmap mask and passes it; the mask handle is kept and freed like the color bitmap.

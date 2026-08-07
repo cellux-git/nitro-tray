@@ -64,3 +64,7 @@ Needs on-device verification (probe_wmi.exe, elevated, on the target):
   fallback is exercised (probe prints whichever errors surface).
 - `GetGamingFanBehavior` existence and raw readback value (never invoked by
   AeroForge; unproven encoding).
+
+## Comments (debug session 2026-08-07)
+
+Found and fixed the silent startup crash (AV 0xC0000005 in release, no panic): every COM method call in src/comwbem.rs dereferenced the OBJECT pointer as the vtable pointer instead of reading the vtable pointer THROUGH the object (*(obj)); Release (in ComRef::Drop) was correct, all method calls were not. Fixed at all call sites (locator, services, class object, enumerator). Also: windows-sys 0.61 ships CIM_* constants with oleaut VARENUM values (CIM_UINT32=19, CIM_UINT64=21) which differ from wbemcli.h (21/23); canonical values are now defined locally in comwbem.rs. gmInput put now tries UInt64 then UInt32 then decimal-BSTR (reference path: AeroForge uses UI4-then-BSTR only). Verified against the AeroForge native COM path on the dev machine: byte-identical behavior (this machine's stripped provider rejects Put with WBEM_E_INVALID_PARAMETER while CIM cmdlets work via the MI stack); the reference path is proven on the target SKU. On-device verification on the AN16S-61 remains required.
