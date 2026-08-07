@@ -214,6 +214,11 @@ fn view_from(app: &AppCore) -> TrayView {
     let profile = effective
         .profile
         .or_else(|| effective.plan.as_deref().and_then(Profile::from_plan_name));
+    // Read-back smart-charge state; when the adapter can't report it, show
+    // the intent the toggle actually controls (otherwise an unavailable
+    // readback renders the item unchecked and a click appears to "turn off"
+    // an already-enabled intent).
+    let smart_charge = effective.smart_charge.or(Some(app.smart_charge_intent()));
     TrayView {
         power: effective.power,
         percent: effective.percent,
@@ -222,7 +227,7 @@ fn view_from(app: &AppCore) -> TrayView {
         profiles,
         profiles_greyed: degraded,
         plans,
-        smart_charge: effective.smart_charge,
+        smart_charge,
         smart_charge_greyed: degraded,
         plan: effective.plan,
         degraded,
