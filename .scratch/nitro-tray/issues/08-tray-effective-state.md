@@ -69,3 +69,7 @@ when `RegisterPowerSettingNotification` is unavailable).
 ## Comments (debug session 2026-08-07)
 
 CreateIconIndirect fails (NULL) with a 32bpp+alpha color DIB and a NULL hbmMask on Windows 10/11 - the monochrome mask bitmap is required in practice. make_battery_icon now creates a 1bpp CreateBitmap mask and passes it; the mask handle is kept and freed like the color bitmap.
+
+## Comments (reboot verification 2026-08-07)
+
+The logon auto-start can fire before Explorer's notification area exists; Shell_NotifyIconW NIM_ADD then fails once. Tray::create now retries NIM_ADD every second up to 10 attempts before failing.

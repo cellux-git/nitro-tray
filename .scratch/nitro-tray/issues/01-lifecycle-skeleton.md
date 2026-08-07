@@ -21,3 +21,7 @@
 - task.rs: in-process ITaskService COM (winapi taskschd bindings — windows-sys has no TaskScheduler metadata): logon trigger, TASK_LOGON_INTERACTIVE_TOKEN, TASK_RUNLEVEL_HIGHEST, start-when-available, no battery disallow/stop, no execution-time-limit ("PT0S"), RegisterTaskDefinition create-or-update; DeleteTask with ERROR_FILE_NOT_FOUND => Ok. RAII COM init/ptr/BSTR guards.
 - log.rs: `nitro-tray.log` beside the exe, UTC timestamps (hand-rolled civil-from-days, no chrono), mutex-serialized appends, silent no-op when disabled, never panics. Unit tests: disabled writes nothing; enabled appends two lines.
 - On-device verification needed: dual-instance exit, task install/uninstall round trip, silent elevated logon start, UAC prompt on manual launch, tray icon + Quit behavior (with ticket 08).
+
+## Comments (reboot verification 2026-08-07)
+
+Verified on-device: after a reboot the NitroTray logon task auto-launches the app silently at logon (log shows a fresh startup at logon time, no UAC). First run hit the tray NIM_ADD race (Explorer not ready); fixed with a retry loop (see 08). Single-instance mutex correctly rejected nothing (first instance), and a manual second launch is rejected while the first runs.
