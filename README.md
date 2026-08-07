@@ -64,7 +64,9 @@ switching is offered.
 
 The config file is optional and lives **beside the exe**: `nitro-tray.toml`.
 With no file present the app runs on the baked-in defaults. The file is read at
-startup; restart the app to apply changes.
+startup; restart the app to apply changes. A reference file with every setting
+at its default lives in the repo as `nitro-tray.toml` — copy it next to the exe
+and edit.
 
 | Key | Type | Default | Meaning |
 |---|---|---|---|
