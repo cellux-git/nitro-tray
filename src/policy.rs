@@ -55,6 +55,20 @@ impl Profile {
         }
     }
 
+    /// Reverse of `plan_name`: the profile whose Nitro plan is `name`; `None`
+    /// for plans outside the four known Nitro plans. Used by the tray when the
+    /// firmware readback is unavailable (degraded) — the active plan is still
+    /// OS-truth and identifies which profile is in effect.
+    pub fn from_plan_name(name: &str) -> Option<Profile> {
+        match name {
+            "Nitro-Quiet" => Some(Profile::Quiet),
+            "Nitro-Balanced" => Some(Profile::Balanced),
+            "Nitro-Performance" => Some(Profile::Performance),
+            "Nitro-Eco" => Some(Profile::Eco),
+            _ => None,
+        }
+    }
+
     /// Acer firmware platform profile value (spec: quiet 0, balanced 1,
     /// performance 4, eco 6).
     pub fn firmware_value(&self) -> u32 {
@@ -395,6 +409,28 @@ mod tests {
         assert_eq!(e.profile_for(PowerState::Battery), Profile::Eco);
         e.cycle(PowerState::Battery);
         assert_eq!(e.profile_for(PowerState::Ac), Profile::Performance);
+    }
+
+    #[test]
+    fn plan_name_round_trips_with_from_plan_name() {
+        for profile in [
+            Profile::Quiet,
+            Profile::Balanced,
+            Profile::Performance,
+            Profile::Eco,
+        ] {
+            assert_eq!(Profile::from_plan_name(profile.plan_name()), Some(profile));
+        }
+        assert_eq!(Profile::from_plan_name("Balanced"), None);
+        assert_eq!(Profile::from_plan_name("Nitro-Turbo"), None);
+        assert_eq!(Profile::from_plan_name(""), None);
+    }
+
+    #[test]
+    fn from_plan_name_is_case_sensitive_exact() {
+        assert_eq!(Profile::from_plan_name("Nitro-Balanced"), Some(Profile::Balanced));
+        assert_eq!(Profile::from_plan_name("nitro-balanced"), None);
+        assert_eq!(Profile::from_plan_name("Nitro-Balanced "), None);
     }
 
     #[test]

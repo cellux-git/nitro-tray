@@ -21,7 +21,7 @@ use nitro_tray::config;
 use nitro_tray::enforcement;
 use nitro_tray::hotkey::Hotkey;
 use nitro_tray::log;
-use nitro_tray::policy::{PowerState, AC_PROFILES, BATTERY_PROFILES};
+use nitro_tray::policy::{PowerState, Profile, AC_PROFILES, BATTERY_PROFILES};
 use nitro_tray::reapply;
 use nitro_tray::task;
 use nitro_tray::tray::{Tray, TrayEvent, TrayView};
@@ -209,10 +209,15 @@ fn view_from(app: &AppCore) -> TrayView {
     };
     let degraded = !app.wmi_available();
     let plans = if degraded { profiles.clone() } else { Vec::new() };
+    // Read-back firmware profile; when WMI can't report it, the active
+    // Windows plan is still OS-truth and identifies the profile in effect.
+    let profile = effective
+        .profile
+        .or_else(|| effective.plan.as_deref().and_then(Profile::from_plan_name));
     TrayView {
         power: effective.power,
         percent: effective.percent,
-        profile: effective.profile,
+        profile,
         eco_disabled: app.eco_disabled(),
         profiles,
         profiles_greyed: degraded,
