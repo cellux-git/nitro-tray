@@ -40,6 +40,7 @@ comwbem carries a `# Safety` contract.
 | 12 Enforcement | `src/enforcement.rs`, event parts of `src/main.rs` |
 | 13 Reapply | `src/reapply.rs`, timer parts of `src/main.rs` |
 | 14 Docs | `README.md` |
+| 15 WMI recovery | `src/recovery.rs`, readback parts of `src/charge.rs`, reconnect parts of `src/app.rs`, timer parts of `src/main.rs` + `src/tray.rs` |
 | (shared) | `src/comwbem.rs` — owned by nobody/refactor; WMI + charge adapters use it |
 
 `src/main.rs` is extended sequentially (01 -> 08 -> 09 -> 10 -> 12 -> 11 -> 13).
@@ -74,16 +75,19 @@ structure flat: one event-dispatch match, one set of `app` calls, one
    on each eco selection attempt. `cycle_profile` skips a disabled eco so the
    hotkey can never select it.
 3. **Persistence**: `nitro-tray.state.toml` beside the exe holds
-   `[picks] ac = "balanced" battery = "eco"` and `smart_charge = true` (only
-   written when the user changes something; absent entries fall back to
-   config). Toggling smart charge updates intent AND persists it, so startup
-   enforcement keeps the user's choice.
+   `[picks] ac = "balanced" battery = "eco"` (only written when the user
+   changes something; absent entries fall back to config). Smart charge is
+   always on and cannot be configured, so it is never persisted. A legacy
+   `smart_charge` key in old state files is ignored.
 4. **Degraded mode**: `WmiAdapter::connect()` failing => `wmi_available() ==
    false`; tray shows "Hardware unavailable", profile + smart-charge items
    greyed (the eco entry is greyed individually via `TrayView.eco_disabled`
    when the firmware rejected profile 6); the "Windows plan" section
    (`TrayView.plans`, raised as `TrayEvent::SelectPlan`) still offers plan
-   switching via `AppCore::apply_plan` (plan-only, no firmware).
+   switching via `AppCore::apply_plan` (plan-only, no firmware). Degraded is
+   never terminal: the always-armed recovery timer (30 s) reconnects broken
+   adapters with a fresh COM stack, re-runs enforcement, and the tray view
+   clears by itself.
 5. **Apply path (AppCore)**: full apply = WMI profile (if available), HID
    usage mode (log-only on failure), fan auto (WMI), smart charge, active
    plan. HID failure is never fatal.
@@ -117,12 +121,17 @@ fallback_tuples, desired_status_from_rows, method_succeeded}` (a set attempt
 only counts as success with a present, truthy, non-error `ReturnValue`),
 `power_state::{read, PowerStateSnapshot, SLOW_POLL_MS}`,
 `tray::{Tray, TrayView, TrayEvent, TrayError}` (TrayView also carries
-`eco_disabled` + `plans`; `TrayEvent::SelectPlan`),
-`app::{AppCore, EffectiveState, STATE_FILE_NAME}` (+`apply_plan`),
+`eco_disabled` + `plans` + ephemeral `status`; `TrayEvent::SelectPlan`),
+`app::{AppCore, EffectiveState, ApplyReport, STATE_FILE_NAME}` (+`apply_plan`;
+`apply_profile`/`cycle_profile`/`apply_plan` return an `ApplyReport`
+(`failed` = errored items, `skipped` = intended items whose adapter is
+unavailable — never counted as failures) formatted for the tray status line
+by the pure `apply_report_text`),
 `hotkey::{Hotkey, parse_spec, DEFAULT_SPEC}`, `enforcement::{on_startup,
 on_power_changed, on_resume}`, `reapply::{enabled, interval_ms, on_tick,
-TIMER_ID}`, `task::{install_logon_task, uninstall_logon_task, TASK_NAME}`,
-`log::{set_enabled, init, info, warn, error}`, `comwbem::{...}`.
+TIMER_ID}`, `recovery::{on_tick, TIMER_ID, INTERVAL_MS, READBACK_TIMER_ID,
+READBACK_INTERVAL_MS}`, `task::{install_logon_task, uninstall_logon_task,
+TASK_NAME}`, `log::{set_enabled, init, info, warn, error}`, `comwbem::{...}`.
 
 ## Workflow notes for agents
 

@@ -3,6 +3,11 @@
 //! write path for the target SKU class (see
 //! `.scratch/nitro-tray/prior-art-aeroforge.md`). No interpreter is spawned.
 //! Raw COM `ExecMethod` via the shared `comwbem` module.
+//!
+//! No sweeping, ever: the readback is a single direct-trust pair (battery 1,
+//! function query 1), never the 35-call `uBatteryNo` x `uFunctionQuery`
+//! sweep. A full-sweep discovery mode is deliberately absent; if a future
+//! machine needs it, that is a config/decision point, not a default.
 
 use std::cell::Cell;
 use std::time::Duration;
@@ -18,8 +23,18 @@ use crate::log;
 const CIM_UINT8_ARRAY: i32 = CIM_UINT8 | CIM_FLAG_ARRAY;
 
 /// Consecutive failures after which the adapter disables itself (a flapping
-/// provider can destabilize in-proc WbemCore into access violations).
+/// provider can destabilize in-proc WbemCore into access violations). A dead
+/// adapter is recovered by the periodic reconnect loop, never terminal.
 const MAX_ADAPTER_FAILURES: u32 = 5;
+
+/// Single-pair readback tuple, verified live via the MI stack on the
+/// AN16S-61 (2026-08-07): battery 1 answers every `uFunctionQuery` with
+/// `uFunctionList=3` and `uFunctionStatus=[0,1,0,0,0]` (health status at
+/// index 1 — `0` healthy/`1` cap in effect); battery 0 returns an empty row
+/// (`uReturn=1`). Query 1 targets the function bit preferred by prior-art
+/// `Find-DesiredStatus` (`uFunctionList & 2`, `uFunctionStatus[1]`).
+const READBACK_BATTERY: u8 = 1;
+const READBACK_QUERY: u8 = 1;
 
 /// Errors from the smart-charge WMI layer.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -61,10 +76,11 @@ pub fn fallback_tuples(status: u8) -> Vec<(u8, u8, u8, [u8; 5])> {
     ]
 }
 
-/// Decodes the health-status byte from a sweep of readback rows. Prefers the
+/// Decodes the health-status byte from readback rows. Prefers the
 /// first row where `uFunctionList & 2 != 0` and `uFunctionStatus[1]` is a real
 /// status; falls back to any status byte of 0/1; last resort is the max
-/// non-255 status byte (prior-art §3.4).
+/// non-255 status byte (prior-art §3.4). The single-pair readback feeds
+/// exactly one row here.
 pub fn desired_status_from_rows(rows: &[(u32, &[u8])]) -> Option<u8> {
     for (list, statuses) in rows {
         if list & 2 != 0 && statuses.len() >= 2 && statuses[1] != 0xFF {
@@ -192,27 +208,27 @@ impl SmartChargeAdapter {
         })
     }
 
-    /// Read back the current smart-charge state (`GetBatteryHealthControlStatus`).
+    /// Read back the current smart-charge state
+    /// (`GetBatteryHealthControlStatus`): one direct-trust pair (battery 1,
+    /// query 1), decoded with the prior-art preference (function-list bit 1,
+    /// status byte index 1). No sweeping; a rejected or empty row degrades to
+    /// an error (the caller shows `None`).
     pub fn is_enabled(&self) -> Result<bool, ChargeError> {
         self.guarded(|| {
             let path = unsafe { comwbem::first_instance_path(&self.services, CLASS_NAME) }
                 .map_err(|hr| ChargeError::Com { hr, op: "first_instance_path(BatteryControl)" })?;
-            let mut rows: Vec<(u32, Vec<u8>)> = Vec::new();
-            for battery in 0u8..5 {
-                for query in 0u8..7 {
-                    if let Some(row) = self.exec_get(&path, battery, query)? {
-                        rows.push(row);
-                    }
-                }
-            }
-            let refs: Vec<(u32, &[u8])> = rows
-                .iter()
-                .map(|(list, statuses)| (*list, statuses.as_slice()))
-                .collect();
+            let row = self
+                .exec_get(&path, READBACK_BATTERY, READBACK_QUERY)?
+                .ok_or_else(|| {
+                    ChargeError::Unexpected(
+                        "no GetBatteryHealthControlStatus row for the direct-trust pair".into(),
+                    )
+                })?;
+            let refs = [(row.0, row.1.as_slice())];
             match desired_status_from_rows(&refs) {
                 Some(status) => Ok(status == 1),
                 None => Err(ChargeError::Unexpected(
-                    "no health status found across GetBatteryHealthControlStatus sweep".into(),
+                    "no health status found in the readback row".into(),
                 )),
             }
         })
@@ -381,6 +397,17 @@ mod tests {
             (3u32, &[255u8, 1u8][..]),
         ];
         assert_eq!(desired_status_from_rows(&rows), Some(1));
+    }
+
+    #[test]
+    fn decodes_the_live_an16s_61_readback_row() {
+        // Verified via MI on the AN16S-61 (2026-08-07): battery 1 answers
+        // `uFunctionList=3, uFunctionStatus=[0,1,0,0,0]`; index 1 is the
+        // health-status byte (1 = cap in effect).
+        let enabled_row = (3u32, &[0u8, 1, 0, 0, 0][..]);
+        assert_eq!(desired_status_from_rows(&[enabled_row]), Some(1));
+        let disabled_row = (3u32, &[0u8, 0, 0, 0, 0][..]);
+        assert_eq!(desired_status_from_rows(&[disabled_row]), Some(0));
     }
 
     #[test]

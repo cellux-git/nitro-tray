@@ -16,13 +16,14 @@ use windows_sys::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS, HANDLE}
 use windows_sys::Win32::System::Threading::CreateMutexW;
 use windows_sys::Win32::UI::WindowsAndMessaging::{DispatchMessageW, GetMessageW, PostQuitMessage, MSG};
 
-use nitro_tray::app::AppCore;
+use nitro_tray::app::{apply_report_text, AppCore, ApplyReport};
 use nitro_tray::config;
 use nitro_tray::enforcement;
 use nitro_tray::hotkey::Hotkey;
 use nitro_tray::log;
 use nitro_tray::policy::{PowerState, Profile, AC_PROFILES, BATTERY_PROFILES};
 use nitro_tray::reapply;
+use nitro_tray::recovery;
 use nitro_tray::task;
 use nitro_tray::tray::{Tray, TrayEvent, TrayView};
 
@@ -126,6 +127,20 @@ fn main() {
         }
     }
 
+    // Recovery and the periodic readback are always armed — broken adapters
+    // must recover and the tray view must refresh even when reapply is off.
+    match tray.start_timer(recovery::TIMER_ID, recovery::INTERVAL_MS) {
+        Ok(()) => log::info(format!("recovery loop armed; interval {} ms", recovery::INTERVAL_MS)),
+        Err(err) => log::warn(format!("recovery: failed to arm timer: {err:?}")),
+    }
+    match tray.start_timer(recovery::READBACK_TIMER_ID, recovery::READBACK_INTERVAL_MS) {
+        Ok(()) => log::info(format!(
+            "readback loop armed; interval {} ms",
+            recovery::READBACK_INTERVAL_MS
+        )),
+        Err(err) => log::warn(format!("recovery: failed to arm readback timer: {err:?}")),
+    }
+
     enforcement::on_startup(&mut app);
     log::info("startup enforcement complete");
 
@@ -227,7 +242,20 @@ fn view_from(app: &AppCore) -> TrayView {
         plans,
         smart_charge,
         plan: effective.plan,
+        // The status line is set by the user-action handlers only.
+        status: None,
         degraded,
+    }
+}
+
+/// Push a view whose status line reports the outcome of a user-initiated
+/// change: "Applied", "Failed: <items>", "Not applied: <items>", or a mix.
+/// Ephemeral — the tray clears it when the menu is dismissed; no history.
+fn update_with_status(app: &AppCore, tray: &Tray, report: &ApplyReport) {
+    let mut view = view_from(app);
+    view.status = Some(apply_report_text(report));
+    if let Err(e) = tray.update(&view) {
+        log::warn(format!("failed to update tray view: {e:?}"));
     }
 }
 
@@ -242,10 +270,8 @@ fn handle_event(app: &mut AppCore, tray: &Tray, ev: TrayEvent) {
         }
         TrayEvent::SelectProfile(profile) => {
             log::info(format!("profile selected: {}", profile.as_str()));
-            app.apply_profile(profile);
-            if let Err(e) = tray.update(&view_from(app)) {
-                log::warn(format!("failed to update tray view: {e:?}"));
-            }
+            let failed = app.apply_profile(profile);
+            update_with_status(app, tray, &failed);
         }
         TrayEvent::PowerChanged => {
             log::info("power state changed");
@@ -262,22 +288,34 @@ fn handle_event(app: &mut AppCore, tray: &Tray, ev: TrayEvent) {
             }
         }
         TrayEvent::HotkeyPressed => {
-            let profile = app.cycle_profile();
+            let (profile, failed) = app.cycle_profile();
             log::info(format!("hotkey cycled to profile {}", profile.as_str()));
-            if let Err(e) = tray.update(&view_from(app)) {
-                log::warn(format!("failed to update tray view: {e:?}"));
-            }
+            update_with_status(app, tray, &failed);
             tray.notify("Nitro Tray", &format!("Profile: {}", profile.as_str()));
         }
         TrayEvent::ReapplyTick => {
             reapply::on_tick(app);
         }
-        TrayEvent::SelectPlan(profile) => {
-            log::info(format!("plan selected: {}", profile.plan_name()));
-            app.apply_plan(profile);
+        TrayEvent::RecoveryTick => {
+            if recovery::on_tick(app) {
+                log::info("recovery: adapter reconnected; enforcing and refreshing tray");
+                if let Err(e) = tray.update(&view_from(app)) {
+                    log::warn(format!("failed to update tray view: {e:?}"));
+                }
+            }
+        }
+        TrayEvent::ReadbackTick => {
+            // Targeted state re-reads (single profile read, single-pair
+            // smart-charge read, plan read) + view refresh; keeps a quiet
+            // session from leaving stale or degraded-looking tray state.
             if let Err(e) = tray.update(&view_from(app)) {
                 log::warn(format!("failed to update tray view: {e:?}"));
             }
+        }
+        TrayEvent::SelectPlan(profile) => {
+            log::info(format!("plan selected: {}", profile.plan_name()));
+            let failed = app.apply_plan(profile);
+            update_with_status(app, tray, &failed);
         }
     }
 }

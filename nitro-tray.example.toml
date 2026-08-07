@@ -6,8 +6,8 @@
 # file is a no-op that documents every setting. Invalid values are ignored and
 # the default is used instead. Unknown keys and sections are ignored.
 
-# Smart charge (80% charge cap) on at startup.
-smart_charge = true
+# Smart charge (80% charge cap) is always enforced on and cannot be
+# configured. A legacy `smart_charge` key is accepted and ignored.
 
 # Default profile on AC: "quiet" | "balanced" | "performance".
 ac_profile = "balanced"

@@ -16,6 +16,7 @@ pub mod policy;
 pub mod power;
 pub mod power_state;
 pub mod reapply;
+pub mod recovery;
 pub mod task;
 pub mod tray;
 pub mod wmi;

@@ -43,6 +43,7 @@ use crate::log;
 use crate::policy::{PowerState, Profile};
 use crate::power_state::{self, PowerStateSnapshot};
 use crate::reapply;
+use crate::recovery;
 
 /// Hidden window class (tray icon owner, power notifications, poll timer).
 /// The class name is a `w!` literal (the macro takes literals only).
@@ -84,6 +85,11 @@ pub enum TrayEvent {
     HotkeyPressed,
     /// The reapply timer ticked (WM_TIMER, reapply::TIMER_ID).
     ReapplyTick,
+    /// The recovery timer ticked (WM_TIMER, recovery::TIMER_ID): retry
+    /// adapters that failed their circuit breaker.
+    RecoveryTick,
+    /// The periodic readback timer ticked (WM_TIMER, recovery::READBACK_TIMER_ID).
+    ReadbackTick,
     /// The user picked a Windows plan in the degraded-mode plan section.
     SelectPlan(Profile),
 }
@@ -110,6 +116,10 @@ pub struct TrayView {
     pub smart_charge: Option<bool>,
     /// Active Windows plan name; `None` when unknown.
     pub plan: Option<String>,
+    /// Ephemeral status line at the bottom of the menu: last apply outcome
+    /// ("Applied" / "Failed: ..."), shown only until the menu is dismissed.
+    /// `None` = no line.
+    pub status: Option<String>,
     /// Show the degraded "Hardware unavailable" state.
     pub degraded: bool,
 }
@@ -184,6 +194,7 @@ impl Tray {
                     plans: Vec::new(),
                     smart_charge: None,
                     plan: None,
+                    status: None,
                     degraded: false,
                 }),
                 last_snapshot: RefCell::new(power_state::read()),
@@ -323,6 +334,8 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
         WM_TIMER => match wparam {
             POLL_TIMER_ID => poll_power(state),
             reapply::TIMER_ID => send_event(state, TrayEvent::ReapplyTick),
+            recovery::TIMER_ID => send_event(state, TrayEvent::RecoveryTick),
+            recovery::READBACK_TIMER_ID => send_event(state, TrayEvent::ReadbackTick),
             _ => {}
         },
         WM_HOTKEY => {
@@ -467,6 +480,13 @@ fn open_menu(hwnd: HWND, state: &TrayState) {
     append_separator(menu);
     append_item(menu, MF_STRING, MENU_QUIT, "Quit");
 
+    // Ephemeral status line: the last apply outcome; cleared on dismissal
+    // (no history is kept).
+    if let Some(status) = &view.status {
+        append_separator(menu);
+        append_item(menu, MF_GRAYED | MF_DISABLED, 0, status);
+    }
+
     let mut pt = POINT::default();
     unsafe { GetCursorPos(&mut pt) };
     unsafe {
@@ -497,6 +517,11 @@ fn open_menu(hwnd: HWND, state: &TrayState) {
             if let Some(&profile) = view.plans.get(id - MENU_PLAN_BASE) {
                 send_event(state, TrayEvent::SelectPlan(profile));
             }
+        }
+        0 => {
+            // Dismissed without a pick (unfocus): the status line is
+            // ephemeral — no history is kept.
+            state.view.borrow_mut().status = None;
         }
         _ => {}
     }
@@ -664,6 +689,7 @@ mod tests {
             plans: Vec::new(),
             smart_charge: None,
             plan: plan.map(String::from),
+            status: None,
             degraded: false,
         }
     }
@@ -680,6 +706,7 @@ mod tests {
             plans: Vec::new(),
             smart_charge: Some(true),
             plan: Some("Nitro-Balanced".to_string()),
+            status: None,
             degraded: false,
         };
         let text = tooltip_text(&v);

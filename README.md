@@ -59,7 +59,11 @@ Additional behavior:
 
 If the Acer WMI interface is unreachable, the tray shows "Hardware
 unavailable", profile and smart-charge items are greyed out, and only plan
-switching is offered.
+switching is offered. Degraded is not permanent: the app retries the
+interface every 30 seconds and re-applies the intended state as soon as it
+returns, so "Hardware unavailable" clears by itself. The tray also re-reads
+the effective state once a minute, so it cannot show stale values during a
+quiet session.
 
 ## Configuration
 
@@ -71,7 +75,6 @@ the exe as `nitro-tray.toml` and edit.
 
 | Key | Type | Default | Meaning |
 |---|---|---|---|
-| `smart_charge` | bool | `true` | Smart charge (80% cap) on at startup |
 | `ac_profile` | string | `"balanced"` | Default AC profile: `quiet` \| `balanced` \| `performance` |
 | `battery_profile` | string | `"eco"` | Default battery profile: `eco` \| `balanced` |
 | `auto_switch` | bool | `true` | Auto-apply the profile on power transitions |
@@ -80,12 +83,13 @@ the exe as `nitro-tray.toml` and edit.
 | `hotkey` | string | `"ctrl-alt-p"` | Global hotkey: `ctrl\|alt\|shift\|win` modifiers + key (`a`–`z`, `0`–`9`, `f1`–`f24`) |
 | `log` | bool | `false` | Debug log to `nitro-tray.log` beside the exe (the `--log` flag enables it per launch) |
 
+Smart charge (80% charge cap) is always enforced on and cannot be configured.
+Legacy config files that still carry a `smart_charge` key are accepted and the
+key is ignored.
+
 Example `nitro-tray.toml`:
 
 ```toml
-# Smart charge (80% cap) on at startup
-smart_charge = true
-
 # Default profile on AC: quiet | balanced | performance
 ac_profile = "balanced"
 

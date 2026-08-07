@@ -2,7 +2,8 @@
 //! path (firmware profile, HID usage mode, fan auto, smart charge, plan),
 //! runtime eco acceptance detection, per-power-state pick persistence
 //! (`nitro-tray.state.toml` beside the exe), and the read-back effective
-//! state. Degrades gracefully when the Acer WMI interface is unreachable.
+//! state. Degrades gracefully when the Acer WMI interface is unreachable;
+//! unavailable adapters are reconnected by the recovery loop, never terminal.
 
 use std::path::{Path, PathBuf};
 use std::sync::Once;
@@ -50,6 +51,11 @@ pub struct AppCore {
     eco_accepted: Option<bool>,
     last_power: PowerStateSnapshot,
     state_path: PathBuf,
+    /// Logged a failed wmi reconnect at least once in the current degradation
+    /// episode (reset on recovery), so the 30 s retry loop never log-spams.
+    wmi_retry_logged: bool,
+    /// Same as `wmi_retry_logged`, for the smart-charge adapter.
+    charge_retry_logged: bool,
 }
 
 impl AppCore {
@@ -108,6 +114,8 @@ impl AppCore {
             eco_accepted: None,
             last_power: power_state::read(),
             state_path,
+            wmi_retry_logged: false,
+            charge_retry_logged: false,
         }
     }
 
@@ -159,21 +167,23 @@ impl AppCore {
     }
 
     /// Apply a profile immediately (full apply), persist the per-power-state
-    /// pick, run eco runtime detection when the pick is eco.
-    pub fn apply_profile(&mut self, profile: Profile) {
+    /// pick, run eco runtime detection when the pick is eco. Returns the
+    /// apply outcome (failed + skipped items), for the tray's status line.
+    pub fn apply_profile(&mut self, profile: Profile) -> ApplyReport {
         let snapshot = self.refresh_power();
         self.engine.set_profile(snapshot.state, profile);
         self.write_state_file();
         if profile == Profile::Eco {
             self.detect_eco();
         }
-        self.apply_full(snapshot.state);
+        self.apply_full(snapshot.state)
     }
 
     /// Cycle forward through the current power state's list, apply, persist;
     /// returns the new profile. A disabled eco entry is skipped so the hotkey
-    /// can never select a profile the firmware rejects.
-    pub fn cycle_profile(&mut self) -> Profile {
+    /// can never select a profile the firmware rejects. The apply result is
+    /// reported like `apply_profile` (for the tray's status line).
+    pub fn cycle_profile(&mut self) -> (Profile, ApplyReport) {
         let snapshot = self.refresh_power();
         let mut next = self.engine.cycle(snapshot.state);
         if next == Profile::Eco && self.eco_disabled() {
@@ -183,8 +193,8 @@ impl AppCore {
         if next == Profile::Eco {
             self.detect_eco();
         }
-        self.apply_full(snapshot.state);
-        next
+        let report = self.apply_full(snapshot.state);
+        (next, report)
     }
 
     /// Ensure the four Nitro plans exist (recreate deleted ones).
@@ -225,18 +235,82 @@ impl AppCore {
     }
 
     /// Apply only the Windows plan for a profile (degraded mode: still
-    /// offered when the Acer WMI interface is unavailable).
-    pub fn apply_plan(&self, profile: Profile) {
+    /// offered when the Acer WMI interface is unavailable). Returns the apply
+    /// outcome, for the tray's status line.
+    pub fn apply_plan(&self, profile: Profile) -> ApplyReport {
         let plan = profile.plan_name();
         match PowerApi::set_active_plan(plan) {
-            Ok(()) => log::info(format!("power: active plan set to {plan}")),
-            Err(err) => log::warn(format!("power: failed to set active plan {plan}: {err:?}")),
+            Ok(()) => {
+                log::info(format!("power: active plan set to {plan}"));
+                ApplyReport::default()
+            }
+            Err(err) => {
+                log::warn(format!("power: failed to set active plan {plan}: {err:?}"));
+                ApplyReport {
+                    failed: vec!["plan"],
+                    skipped: Vec::new(),
+                }
+            }
         }
     }
 
     /// Acer WMI interface reachable?
     pub fn wmi_available(&self) -> bool {
         self.wmi.as_ref().is_some_and(|wmi| wmi.is_available())
+    }
+
+    /// Smart-charge adapter usable (connected and not breaker-tripped)?
+    pub fn charge_available(&self) -> bool {
+        self.charge.as_ref().is_some_and(|charge| charge.is_available())
+    }
+
+    /// Try to reconnect adapters that are missing or tripped their circuit
+    /// breaker (driven by the always-armed 30 s recovery timer). A fresh
+    /// `connect()` replaces the old adapter only on full success — the
+    /// breaker is never reset on a single successful call. On any reconnect,
+    /// eco acceptance is re-evaluated and enforcement re-runs. Returns true
+    /// when an adapter reconnected, so the caller refreshes the tray view
+    /// ("Hardware unavailable" clears by itself). Failed attempts log at most
+    /// once per degradation episode, never once per tick.
+    pub fn reconnect_unavailable(&mut self) -> bool {
+        let mut reconnected = false;
+        if !self.wmi_available() {
+            match WmiAdapter::connect() {
+                Ok(adapter) => {
+                    log::info("wmi: reconnected; leaving degraded mode");
+                    self.wmi = Some(adapter);
+                    self.wmi_retry_logged = false;
+                    reconnected = true;
+                }
+                Err(err) => {
+                    if !self.wmi_retry_logged {
+                        log::warn(format!("wmi: reconnect failed, still degraded: {err:?}"));
+                        self.wmi_retry_logged = true;
+                    }
+                }
+            }
+        }
+        if !self.charge_available() {
+            match SmartChargeAdapter::connect() {
+                Ok(adapter) => {
+                    log::info("charge: smart-charge adapter reconnected");
+                    self.charge = Some(adapter);
+                    self.charge_retry_logged = false;
+                    reconnected = true;
+                }
+                Err(err) => {
+                    if !self.charge_retry_logged {
+                        log::warn(format!("charge: reconnect failed: {err:?}"));
+                        self.charge_retry_logged = true;
+                    }
+                }
+            }
+        }
+        if reconnected {
+            self.re_evaluate_eco();
+            self.enforce_now();
+        }
+        reconnected
     }
 
     /// Eco entry disabled (firmware rejected profile 6)?
@@ -319,54 +393,82 @@ impl AppCore {
 
     /// Full intended apply for a power state. Runs first-time eco detection
     /// when the current pick is eco and acceptance is still unknown
-    /// (automatic enforcement paths).
-    fn apply_full(&mut self, state: PowerState) {
+    /// (automatic enforcement paths). Returns the apply outcome.
+    fn apply_full(&mut self, state: PowerState) -> ApplyReport {
         if self.engine.profile_for(state) == Profile::Eco && self.eco_accepted.is_none() {
             self.detect_eco();
         }
         let intent = self.engine.intended(state, self.eco_ok());
-        self.apply_intended(&intent);
+        self.apply_intended(&intent)
     }
 
     /// Apply one intended state to the hardware/OS: WMI profile, HID usage
     /// mode (log-only on failure, never fatal), fan auto, smart charge, and
     /// the active plan. Every item is applied independently; failures are
-    /// logged and never abort the rest. Smart charge is always targeted on —
-    /// it cannot be disabled in the app — so every apply is a best-effort
-    /// enable attempt (writes are retried by the reapply loop when enabled).
-    fn apply_intended(&self, intent: &IntendedState) {
-        if let (Some(wmi), Some(value)) = (self.wmi.as_ref(), intent.firmware_profile) {
-            match wmi.set_platform_profile(value) {
-                Ok(()) => log::info(format!("wmi: platform profile set to {value}")),
-                Err(err) => log::warn(format!("wmi: failed to set platform profile {value}: {err:?}")),
+    /// logged, never abort the rest, and reported so the tray can show the
+    /// outcome. An item whose adapter is unavailable is reported as *not
+    /// applied* (never "Applied" and never a failure — the tray already shows
+    /// the degraded state). A `None` firmware target (eco rejected) is not an
+    /// item at all. Smart charge is always targeted on — it cannot be
+    /// disabled in the app — so every apply is a best-effort enable attempt
+    /// (writes are retried by the reapply loop when enabled).
+    fn apply_intended(&self, intent: &IntendedState) -> ApplyReport {
+        let mut report = ApplyReport::default();
+        if let Some(value) = intent.firmware_profile {
+            match self.wmi.as_ref() {
+                Some(wmi) => match wmi.set_platform_profile(value) {
+                    Ok(()) => log::info(format!("wmi: platform profile set to {value}")),
+                    Err(err) => {
+                        log::warn(format!("wmi: failed to set platform profile {value}: {err:?}"));
+                        report.failed.push("platform profile");
+                    }
+                },
+                None => report.skipped.push("platform profile"),
             }
         }
         if let Some(hid) = self.hid.as_ref() {
             match hid.set_usage_mode(intent.hid_mode) {
                 Ok(()) => log::info(format!("hid: usage mode set to {:?}", intent.hid_mode)),
                 Err(err) => {
-                    log::warn(format!("hid: failed to set usage mode {:?}: {err:?}", intent.hid_mode))
+                    log::warn(format!("hid: failed to set usage mode {:?}: {err:?}", intent.hid_mode));
+                    report.failed.push("HID mode");
                 }
             }
+        } else {
+            report.skipped.push("HID mode");
         }
         if let Some(wmi) = self.wmi.as_ref() {
             match wmi.set_fan_auto() {
                 Ok(()) => log::info("wmi: fan set to auto"),
-                Err(err) => log::warn(format!("wmi: failed to set fan auto: {err:?}")),
+                Err(err) => {
+                    log::warn(format!("wmi: failed to set fan auto: {err:?}"));
+                    report.failed.push("fan");
+                }
             }
+        } else {
+            report.skipped.push("fan");
         }
         if let Some(charge) = self.charge.as_ref() {
             match charge.set_enabled(true) {
                 Ok(()) => log::info("charge: smart charge enabled"),
-                Err(err) => log::warn(format!("charge: failed to enable smart charge: {err:?}")),
+                Err(err) => {
+                    log::warn(format!("charge: failed to enable smart charge: {err:?}"));
+                    report.failed.push("smart charge");
+                }
             }
+        } else {
+            report.skipped.push("smart charge");
         }
         if let Some(plan) = intent.plan {
             match PowerApi::set_active_plan(plan) {
                 Ok(()) => log::info(format!("power: active plan set to {plan}")),
-                Err(err) => log::warn(format!("power: failed to set active plan {plan}: {err:?}")),
+                Err(err) => {
+                    log::warn(format!("power: failed to set active plan {plan}: {err:?}"));
+                    report.failed.push("plan");
+                }
             }
         }
+        report
     }
 
     /// Persist the per-power-state picks to the state file. Smart charge is
@@ -408,6 +510,34 @@ fn serialize_state(picks: (Profile, Profile)) -> String {
     toml::to_string(&toml::Value::Table(root)).unwrap_or_default()
 }
 
+/// Outcome of one apply, for the tray's ephemeral status line.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ApplyReport {
+    /// Labels of apply items that errored.
+    pub failed: Vec<&'static str>,
+    /// Labels of apply items that were intended but could not run because
+    /// their adapter is unavailable (never counted as failures — the tray
+    /// already shows the degraded state).
+    pub skipped: Vec<&'static str>,
+}
+
+/// Status-line text for an apply outcome: "Applied" when nothing failed or
+/// was skipped, else "Failed: <labels>" / "Not applied: <labels>" (or both,
+/// joined). Ephemeral feedback — no history is kept.
+pub fn apply_report_text(report: &ApplyReport) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if !report.failed.is_empty() {
+        parts.push(format!("Failed: {}", report.failed.join(", ")));
+    }
+    if !report.skipped.is_empty() {
+        parts.push(format!("Not applied: {}", report.skipped.join(", ")));
+    }
+    if parts.is_empty() {
+        "Applied".to_string()
+    } else {
+        parts.join("; ")
+    }
+}
 /// Map a firmware platform-profile readback to a `Profile` (0 quiet, 1
 /// balanced, 4 performance, 6 eco); `None` for unknown values (e.g. turbo 5).
 fn profile_from_firmware(value: u32) -> Option<Profile> {
@@ -498,5 +628,45 @@ mod tests {
         for value in [2, 3, 5, 7, 0xFF] {
             assert_eq!(profile_from_firmware(value), None, "value {value}");
         }
+    }
+
+    #[test]
+    fn apply_report_empty_means_applied() {
+        assert_eq!(apply_report_text(&ApplyReport::default()), "Applied");
+    }
+
+    #[test]
+    fn apply_report_lists_failed_items() {
+        let report = ApplyReport { failed: vec!["plan"], skipped: Vec::new() };
+        assert_eq!(apply_report_text(&report), "Failed: plan");
+        let report = ApplyReport {
+            failed: vec!["platform profile", "fan", "smart charge"],
+            skipped: Vec::new(),
+        };
+        assert_eq!(
+            apply_report_text(&report),
+            "Failed: platform profile, fan, smart charge"
+        );
+    }
+
+    #[test]
+    fn apply_report_never_says_applied_when_items_were_skipped() {
+        let report = ApplyReport {
+            failed: Vec::new(),
+            skipped: vec!["platform profile", "fan", "smart charge"],
+        };
+        assert_eq!(
+            apply_report_text(&report),
+            "Not applied: platform profile, fan, smart charge"
+        );
+    }
+
+    #[test]
+    fn apply_report_joins_failed_and_skipped() {
+        let report = ApplyReport {
+            failed: vec!["plan"],
+            skipped: vec!["platform profile"],
+        };
+        assert_eq!(apply_report_text(&report), "Failed: plan; Not applied: platform profile");
     }
 }
