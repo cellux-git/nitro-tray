@@ -61,3 +61,7 @@ Needs on-device verification:
   the expected `VT_UI4` scalar + `VT_ARRAY|VT_UI1` byte array shapes.
 - The readback sweep uses `IEnumWbemClassObject::Next` timeout 0; if the
   provider ever returns an empty first fetch, switch to `WBEM_INFINITE`.
+
+## Comments (code review)
+
+2026-08-07: Review fixes: (1) a SetBatteryHealthControl attempt now only counts as success when the provider's ReturnValue is present, truthy and not an error code (prior-art if ($setAnv.ReturnValue) semantics; missing ReturnValue => attempt failed); (2) fallback tuple list extended with mask-3 variants (1,3)/(0,3) per prior-art 3.3; (3) COM plumbing extracted into the shared src/comwbem.rs module (canonical vtables, one definition - previously duplicated in wmi.rs/charge.rs with drifted vtable tails); (4) CoUninitialize now happens exactly once when the apartment guard owns the init. Documented deviation: the SetBatteryFunctionData mask sweep (prior-art 3.3) is not ported - it is a fallback for unknown SKUs and the direct-trust path is the target path for this SKU; noted on device if the sweep is ever needed.

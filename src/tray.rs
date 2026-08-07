@@ -53,6 +53,7 @@ const WAKE_MSG: u32 = WM_APP + 2;
 const POLL_TIMER_ID: usize = 1;
 const MENU_PROFILE_BASE: usize = 1;
 const MENU_SMART_CHARGE: usize = 100;
+const MENU_PLAN_BASE: usize = 300;
 const MENU_QUIT: usize = 200;
 const ICON_SIZE: i32 = 16;
 
@@ -80,6 +81,8 @@ pub enum TrayEvent {
     HotkeyPressed,
     /// The reapply timer ticked (WM_TIMER, reapply::TIMER_ID).
     ReapplyTick,
+    /// The user picked a Windows plan in the degraded-mode plan section.
+    SelectPlan(Profile),
 }
 
 /// The view the main loop pushes into the tray after each state change: the
@@ -94,6 +97,12 @@ pub struct TrayView {
     pub profiles: Vec<Profile>,
     /// Grey out the profile items (degraded: WMI unavailable).
     pub profiles_greyed: bool,
+    /// Grey out just the eco entry (firmware rejected profile 6).
+    pub eco_disabled: bool,
+    /// Windows plans offered in the degraded-mode "Windows plan" section
+    /// (enabled even when the Acer WMI interface is unavailable). Empty when
+    /// the normal profile section is usable.
+    pub plans: Vec<Profile>,
     /// Read-back smart-charge state; `None` when unavailable.
     pub smart_charge: Option<bool>,
     /// Grey out the smart-charge item (degraded).
@@ -166,8 +175,10 @@ impl Tray {
                     power: PowerState::Ac,
                     percent: 0,
                     profile: None,
+                    eco_disabled: false,
                     profiles: Vec::new(),
                     profiles_greyed: false,
+                    plans: Vec::new(),
                     smart_charge: None,
                     smart_charge_greyed: false,
                     plan: None,
@@ -306,9 +317,8 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
         }
         WM_POWERBROADCAST => {
             match wparam as u32 {
-                PBT_APMPOWERSTATUSCHANGE => send_event(state, TrayEvent::PowerChanged),
+                PBT_APMPOWERSTATUSCHANGE | PBT_POWERSETTINGCHANGE => poll_power(state),
                 PBT_APMRESUMEAUTOMATIC | PBT_APMRESUMESUSPEND => send_event(state, TrayEvent::Resume),
-                PBT_POWERSETTINGCHANGE => poll_power(state),
                 _ => {}
             }
             return 1;
@@ -377,10 +387,11 @@ fn send_event(state: &TrayState, ev: TrayEvent) {
 }
 
 /// Slow-poll fallback and PBT_POWERSETTINGCHANGE: compare the fresh read to
-/// the last snapshot and raise `PowerChanged` on any difference.
+/// the last snapshot and raise `PowerChanged` only when the AC/battery STATE
+/// changed (battery-% drift must not re-assert anything).
 fn poll_power(state: &TrayState) {
     let now = power_state::read();
-    let changed = *state.last_snapshot.borrow() != now;
+    let changed = state.last_snapshot.borrow().state != now.state;
     *state.last_snapshot.borrow_mut() = now;
     if changed {
         send_event(state, TrayEvent::PowerChanged);
@@ -405,12 +416,15 @@ fn open_menu(hwnd: HWND, state: &TrayState) {
         0
     };
     for (i, profile) in view.profiles.iter().enumerate() {
-        let flags = profile_flags
+        let mut flags = profile_flags
             | if Some(*profile) == view.profile {
                 MF_CHECKED
             } else {
                 0
             };
+        if view.eco_disabled && *profile == Profile::Eco {
+            flags |= MF_GRAYED | MF_DISABLED;
+        }
         append_item(menu, flags, MENU_PROFILE_BASE + i, profile_label(*profile));
     }
     append_separator(menu);
@@ -425,6 +439,14 @@ fn open_menu(hwnd: HWND, state: &TrayState) {
     append_item(menu, smart_flags, MENU_SMART_CHARGE, "Smart charge (80% cap)");
     if let Some(plan) = &view.plan {
         append_item(menu, MF_GRAYED | MF_DISABLED, 0, &format!("Plan: {plan}"));
+    }
+    if !view.plans.is_empty() {
+        append_separator(menu);
+        append_item(menu, MF_GRAYED | MF_DISABLED, 0, "Windows plan");
+        for (i, profile) in view.plans.iter().enumerate() {
+            let flags = if Some(*profile) == view.profile { MF_CHECKED } else { 0 };
+            append_item(menu, flags, MENU_PLAN_BASE + i, profile_label(*profile));
+        }
     }
     append_separator(menu);
     append_item(menu, MF_STRING, MENU_QUIT, "Quit");
@@ -454,6 +476,11 @@ fn open_menu(hwnd: HWND, state: &TrayState) {
         id if id >= MENU_PROFILE_BASE && id < MENU_PROFILE_BASE + view.profiles.len() => {
             if let Some(&profile) = view.profiles.get(id - MENU_PROFILE_BASE) {
                 send_event(state, TrayEvent::SelectProfile(profile));
+            }
+        }
+        id if id >= MENU_PLAN_BASE && id < MENU_PLAN_BASE + view.plans.len() => {
+            if let Some(&profile) = view.plans.get(id - MENU_PLAN_BASE) {
+                send_event(state, TrayEvent::SelectPlan(profile));
             }
         }
         _ => {}
@@ -605,8 +632,10 @@ mod tests {
             power,
             percent,
             profile,
+            eco_disabled: false,
             profiles: Vec::new(),
             profiles_greyed: false,
+            plans: Vec::new(),
             smart_charge: None,
             smart_charge_greyed: false,
             plan: plan.map(String::from),
@@ -620,8 +649,10 @@ mod tests {
             power: PowerState::Ac,
             percent: 87,
             profile: Some(Profile::Balanced),
+            eco_disabled: false,
             profiles: Vec::new(),
             profiles_greyed: false,
+            plans: Vec::new(),
             smart_charge: Some(true),
             smart_charge_greyed: false,
             plan: Some("Nitro-Balanced".to_string()),

@@ -6,6 +6,7 @@
 
 pub mod app;
 pub mod charge;
+pub mod comwbem;
 pub mod config;
 pub mod enforcement;
 pub mod hid;

@@ -39,3 +39,7 @@ Needs on-device verification: unplugging the charger applies the battery
 profile (eco default), plugging in applies the AC profile (balanced default),
 resume re-enforces, and everything works with Acer's user-mode services
 stopped or uninstalled (checklist item 6).
+
+## Comments (code review)
+
+2026-08-07: Review fixes: degraded-mode plan switching (US 37) is now real - when WMI is unavailable the tray's 'Windows plan' section offers plan switches (TrayEvent::SelectPlan -> AppCore::apply_plan, plan-only) while profile/smart-charge items stay greyed (US 36).

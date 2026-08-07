@@ -21,7 +21,7 @@ use nitro_tray::config;
 use nitro_tray::enforcement;
 use nitro_tray::hotkey::Hotkey;
 use nitro_tray::log;
-use nitro_tray::policy::{PowerState, Profile, AC_PROFILES, BATTERY_PROFILES};
+use nitro_tray::policy::{PowerState, AC_PROFILES, BATTERY_PROFILES};
 use nitro_tray::reapply;
 use nitro_tray::task;
 use nitro_tray::tray::{Tray, TrayEvent, TrayView};
@@ -159,28 +159,31 @@ fn message_pump(tray: &Tray, app: &mut AppCore, events: &mpsc::Receiver<TrayEven
 }
 
 /// Build the tray view from the app's read-back effective state: profiles
-/// valid for the current power state (eco filtered out when the firmware
-/// rejected it), read-back values for the checked profile, smart charge and
-/// plan, and the degraded flags when the Acer WMI interface is unavailable.
+/// valid for the current power state (eco entry kept but greyed when the
+/// firmware rejected it), read-back values for the checked profile, smart
+/// charge and plan, and the degraded flags when the Acer WMI interface is
+/// unavailable — in that case the "Windows plan" section still offers plan
+/// switches for the current power state's profiles.
 fn view_from(app: &AppCore) -> TrayView {
     let effective = app.effective();
-    let mut profiles = match app.current_power() {
+    let profiles = match app.current_power() {
         PowerState::Ac => AC_PROFILES.to_vec(),
         PowerState::Battery => BATTERY_PROFILES.to_vec(),
     };
-    if app.eco_disabled() {
-        profiles.retain(|profile| *profile != Profile::Eco);
-    }
+    let degraded = !app.wmi_available();
+    let plans = if degraded { profiles.clone() } else { Vec::new() };
     TrayView {
         power: effective.power,
         percent: effective.percent,
         profile: effective.profile,
+        eco_disabled: app.eco_disabled(),
         profiles,
-        profiles_greyed: !app.wmi_available(),
+        profiles_greyed: degraded,
+        plans,
         smart_charge: effective.smart_charge,
-        smart_charge_greyed: !app.wmi_available(),
+        smart_charge_greyed: degraded,
         plan: effective.plan,
-        degraded: !app.wmi_available(),
+        degraded,
     }
 }
 
@@ -234,6 +237,13 @@ fn handle_event(app: &mut AppCore, tray: &Tray, ev: TrayEvent) {
         }
         TrayEvent::ReapplyTick => {
             reapply::on_tick(app);
+        }
+        TrayEvent::SelectPlan(profile) => {
+            log::info(format!("plan selected: {}", profile.plan_name()));
+            app.apply_plan(profile);
+            if let Err(e) = tray.update(&view_from(app)) {
+                log::warn(format!("failed to update tray view: {e:?}"));
+            }
         }
     }
 }

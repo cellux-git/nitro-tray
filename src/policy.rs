@@ -46,7 +46,7 @@ impl Profile {
     }
 
     /// The Nitro Windows power plan for this profile.
-    pub fn plan_name(&self) -> &'static str {
+    pub const fn plan_name(&self) -> &'static str {
         match self {
             Profile::Quiet => "Nitro-Quiet",
             Profile::Balanced => "Nitro-Balanced",

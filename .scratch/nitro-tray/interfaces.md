@@ -13,6 +13,15 @@ from the AeroForge codebase (sibling repo at
 `D:\dev\source\aeroforge-nitrosense-alternative`, read-only). Read it before
 implementing tickets 04/05/06/07.
 
+## Shared COM/WMI module
+
+`src/comwbem.rs` (post-review addition) owns ALL hand-rolled COM/WMI machinery
+(wbemcli.h vtables, minimal VARIANT, BSTR/SAFEARRAY helpers, COM apartment
+guard, `ExecMethod`/`GetObject`/`first_instance_path`). The WMI and smart-charge
+adapters (`src/wmi.rs`, `src/charge.rs`) only encode their method tables and map
+errors; they must NOT redeclare vtables or variants. Every `pub unsafe fn` in
+comwbem carries a `# Safety` contract.
+
 ## Ownership map
 
 | Ticket | Files owned |
@@ -31,6 +40,7 @@ implementing tickets 04/05/06/07.
 | 12 Enforcement | `src/enforcement.rs`, event parts of `src/main.rs` |
 | 13 Reapply | `src/reapply.rs`, timer parts of `src/main.rs` |
 | 14 Docs | `README.md` |
+| (shared) | `src/comwbem.rs` — owned by nobody/refactor; WMI + charge adapters use it |
 
 `src/main.rs` is extended sequentially (01 -> 08 -> 09 -> 10 -> 12 -> 11 -> 13).
 Each later ticket reads main.rs first and adds its own match arms; keep the
@@ -49,14 +59,20 @@ structure flat: one event-dispatch match, one set of `app` calls, one
 ## Design decisions (fixed)
 
 1. **Power-state flow**: tray window's WndProc raises `TrayEvent::PowerChanged`
-   on `WM_POWERBROADCAST` `PBT_APMPOWERSTATUSCHANGE` and on a slow-poll timer
-   (10 s, `power_state::SLOW_POLL_MS`) when `power_state::read()` differs from
-   the last snapshot; `TrayEvent::Resume` on `PBT_APMRESUMEAUTOMATIC` /
-   `PBT_APMRESUMESUSPEND`. The main loop maps events -> `enforcement::*`.
+   on `WM_POWERBROADCAST` `PBT_APMPOWERSTATUSCHANGE`/`PBT_POWERSETTINGCHANGE`
+   and on a slow-poll timer (10 s, `power_state::SLOW_POLL_MS`) — gated on the
+   AC/battery STATE changing, never on battery-% drift (manual plan edits must
+   not be clobbered by percent ticks); `TrayEvent::Resume` on
+   `PBT_APMRESUMEAUTOMATIC` / `PBT_APMRESUMESUSPEND`. The main loop maps events
+   -> `enforcement::*`.
 2. **Eco acceptance**: cached in `AppCore` as `eco_accepted: Option<bool>`.
    First eco apply writes firmware profile 6 via `WmiAdapter`, then readback;
-   mismatch (or error) => rejected. Re-evaluated on power transitions, on
-   reapply ticks, and on each eco selection attempt.
+   mismatch (or error) => rejected AND the previously active firmware profile
+   is restored (best effort) so the machine is never left in an unspecified
+   firmware state. Re-evaluated when currently rejected (on power transitions,
+   on reapply ticks), when acceptance is still unknown and the pick is eco, and
+   on each eco selection attempt. `cycle_profile` skips a disabled eco so the
+   hotkey can never select it.
 3. **Persistence**: `nitro-tray.state.toml` beside the exe holds
    `[picks] ac = "balanced" battery = "eco"` and `smart_charge = true` (only
    written when the user changes something; absent entries fall back to
@@ -64,7 +80,10 @@ structure flat: one event-dispatch match, one set of `app` calls, one
    enforcement keeps the user's choice.
 4. **Degraded mode**: `WmiAdapter::connect()` failing => `wmi_available() ==
    false`; tray shows "Hardware unavailable", profile + smart-charge items
-   greyed; plan switching still offered and applied.
+   greyed (the eco entry is greyed individually via `TrayView.eco_disabled`
+   when the firmware rejected profile 6); the "Windows plan" section
+   (`TrayView.plans`, raised as `TrayEvent::SelectPlan`) still offers plan
+   switching via `AppCore::apply_plan` (plan-only, no firmware).
 5. **Apply path (AppCore)**: full apply = WMI profile (if available), HID
    usage mode (log-only on failure), fan auto (WMI), smart charge, active
    plan. HID failure is never fatal.
@@ -89,16 +108,21 @@ structure flat: one event-dispatch match, one set of `app` calls, one
 See the stub files themselves. Key cross-module types:
 `config::Config` (+`parse`/`load`), `policy::{PowerState, Profile, HidMode,
 IntendedState, PolicyEngine, AC_PROFILES, BATTERY_PROFILES}`,
-`power::{PowerApi, PowerError, CpuTuning, BoostMode, cpu_tuning}`,
+`power::{PowerApi, PowerError, CpuTuning, BoostMode, cpu_tuning, NITRO_PLANS}`
+(NITRO_PLANS is derived from `Profile::plan_name` — single source of truth),
 `wmi::{WmiAdapter, WmiError, PROFILE_*, FAN_AUTO, SETTING_PLATFORM_PROFILE}`,
 `hid::{HidAdapter, HidError, usage_mode_report, usage_mode_from_selector}`,
-`charge::{SmartChargeAdapter, ChargeError}`, `power_state::{read,
-PowerStateSnapshot, SLOW_POLL_MS}`, `tray::{Tray, TrayView, TrayEvent,
-TrayError}`, `app::{AppCore, EffectiveState, STATE_FILE_NAME}`,
+`charge::{SmartChargeAdapter, ChargeError, direct_trust_tuple,
+fallback_tuples, desired_status_from_rows, method_succeeded}` (a set attempt
+only counts as success with a present, truthy, non-error `ReturnValue`),
+`power_state::{read, PowerStateSnapshot, SLOW_POLL_MS}`,
+`tray::{Tray, TrayView, TrayEvent, TrayError}` (TrayView also carries
+`eco_disabled` + `plans`; `TrayEvent::SelectPlan`),
+`app::{AppCore, EffectiveState, STATE_FILE_NAME}` (+`apply_plan`),
 `hotkey::{Hotkey, parse_spec, DEFAULT_SPEC}`, `enforcement::{on_startup,
 on_power_changed, on_resume}`, `reapply::{enabled, interval_ms, on_tick,
 TIMER_ID}`, `task::{install_logon_task, uninstall_logon_task, TASK_NAME}`,
-`log::{set_enabled, init, info, warn, error}`.
+`log::{set_enabled, init, info, warn, error}`, `comwbem::{...}`.
 
 ## Workflow notes for agents
 

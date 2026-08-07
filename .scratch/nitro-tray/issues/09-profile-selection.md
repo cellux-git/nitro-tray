@@ -65,3 +65,7 @@ Needs on-device verification: real WMI/HID/smart-charge connect + writes
 and readbacks (this machine degrades, so effective() returns None forms);
 eco acceptance on AN16S-61 (write 6 + readback path); plan switching with
 WMI down; persisted picks surviving a restart.
+
+## Comments (code review)
+
+2026-08-07: Review fixes: (1) eco rejection now restores the previously active firmware profile (best effort) instead of leaving the machine in an unspecified firmware state; (2) re_evaluate_eco also re-tests when acceptance is unknown and the pick is eco; (3) cycle_profile skips a disabled eco entry so the hotkey cannot select it; (4) profile_from_firmware now uses the wmi::PROFILE_* constants instead of raw literals.

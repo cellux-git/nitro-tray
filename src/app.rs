@@ -177,10 +177,14 @@ impl AppCore {
     }
 
     /// Cycle forward through the current power state's list, apply, persist;
-    /// returns the new profile.
+    /// returns the new profile. A disabled eco entry is skipped so the hotkey
+    /// can never select a profile the firmware rejects.
     pub fn cycle_profile(&mut self) -> Profile {
         let snapshot = self.refresh_power();
-        let next = self.engine.cycle(snapshot.state);
+        let mut next = self.engine.cycle(snapshot.state);
+        if next == Profile::Eco && self.eco_disabled() {
+            next = self.engine.cycle(snapshot.state);
+        }
         self.write_state_file();
         if next == Profile::Eco {
             self.detect_eco();
@@ -223,16 +227,27 @@ impl AppCore {
         self.apply_intended(&intent);
     }
 
-    /// Re-run eco acceptance detection when eco was rejected (called on power
-    /// transitions, on reapply ticks, and after the first eco attempt). Writes
-    /// firmware profile 6 directly and reads back; the previous firmware
-    /// profile is NOT restored here — callers re-apply the intended state
-    /// right after this returns.
+    /// Re-run eco acceptance detection (called on power transitions, on
+    /// reapply ticks, and on each eco selection attempt): re-tests when eco
+    /// is currently rejected, or when acceptance is still unknown and the
+    /// current pick wants eco.
     pub fn re_evaluate_eco(&mut self) {
-        if self.eco_accepted != Some(false) {
+        let state = self.refresh_power().state;
+        let wants_eco = self.engine.profile_for(state) == Profile::Eco;
+        if self.eco_accepted == Some(true) || (self.eco_accepted.is_none() && !wants_eco) {
             return;
         }
         self.detect_eco();
+    }
+
+    /// Apply only the Windows plan for a profile (degraded mode: still
+    /// offered when the Acer WMI interface is unavailable).
+    pub fn apply_plan(&self, profile: Profile) {
+        let plan = profile.plan_name();
+        match PowerApi::set_active_plan(plan) {
+            Ok(()) => log::info(format!("power: active plan set to {plan}")),
+            Err(err) => log::warn(format!("power: failed to set active plan {plan}: {err:?}")),
+        }
     }
 
     /// Acer WMI interface reachable?
@@ -279,28 +294,46 @@ impl AppCore {
 
     /// Eco runtime detection: write firmware profile 6, then read back; the
     /// machine accepts eco only when the readback equals 6. A set error or a
-    /// failed readback while WMI is available means rejected. Caches the
+    /// failed readback while WMI is available means rejected. On rejection the
+    /// previously active firmware profile is restored (best effort), so the
+    /// machine is never left in an unspecified firmware state. Caches the
     /// result in `eco_accepted` (design decision 2).
     fn detect_eco(&mut self) {
-        let Some(wmi) = self.wmi.as_ref() else {
-            return;
+        let (before, accepted) = {
+            let Some(wmi) = self.wmi.as_ref() else {
+                return;
+            };
+            let before = wmi.get_platform_profile().ok();
+            let accepted = match wmi.set_platform_profile(wmi::PROFILE_ECO) {
+                Err(err) => {
+                    log::warn(format!("wmi: eco detection failed to set profile 6: {err:?}"));
+                    None
+                }
+                Ok(()) => match wmi.get_platform_profile() {
+                    Ok(value) => {
+                        let accepted = value == wmi::PROFILE_ECO;
+                        log::info(format!(
+                            "wmi: eco detection readback {value} (eco accepted: {accepted})"
+                        ));
+                        Some(accepted)
+                    }
+                    Err(err) => {
+                        log::warn(format!("wmi: eco detection readback failed: {err:?}"));
+                        None
+                    }
+                },
+            };
+            (before, accepted)
         };
-        if let Err(err) = wmi.set_platform_profile(wmi::PROFILE_ECO) {
-            log::warn(format!("wmi: eco detection failed to set profile 6: {err:?}"));
-            self.eco_accepted = Some(false);
-            return;
-        }
-        match wmi.get_platform_profile() {
-            Ok(value) => {
-                let accepted = value == wmi::PROFILE_ECO;
-                log::info(format!(
-                    "wmi: eco detection readback {value} (eco accepted: {accepted})"
-                ));
-                self.eco_accepted = Some(accepted);
-            }
-            Err(err) => {
-                log::warn(format!("wmi: eco detection readback failed: {err:?}"));
+        match accepted {
+            Some(true) => self.eco_accepted = Some(true),
+            Some(false) | None => {
                 self.eco_accepted = Some(false);
+                if let (Some(wmi), Some(before)) = (self.wmi.as_ref(), before) {
+                    if let Err(err) = wmi.set_platform_profile(before) {
+                        log::warn(format!("wmi: failed to restore profile {before} after eco rejection: {err:?}"));
+                    }
+                }
             }
         }
     }
@@ -411,10 +444,10 @@ fn serialize_state(picks: (Profile, Profile), smart_charge: bool) -> String {
 /// balanced, 4 performance, 6 eco); `None` for unknown values (e.g. turbo 5).
 fn profile_from_firmware(value: u32) -> Option<Profile> {
     match value {
-        0 => Some(Profile::Quiet),
-        1 => Some(Profile::Balanced),
-        4 => Some(Profile::Performance),
-        6 => Some(Profile::Eco),
+        wmi::PROFILE_QUIET => Some(Profile::Quiet),
+        wmi::PROFILE_BALANCED => Some(Profile::Balanced),
+        wmi::PROFILE_PERFORMANCE => Some(Profile::Performance),
+        wmi::PROFILE_ECO => Some(Profile::Eco),
         _ => None,
     }
 }

@@ -61,3 +61,7 @@ On-device verification still needed: icon appearance in the tray, two-line
 tooltip rendering, menu layout/checked states, balloon display, and real
 power-message behavior (unplug/plug, sleep/resume, and the 10 s poll fallback
 when `RegisterPowerSettingNotification` is unavailable).
+
+## Comments (code review)
+
+2026-08-07: Review fixes: (1) PowerChanged is now gated on the AC/battery STATE changing, never on battery-percent drift (manual plan edits are no longer clobbered by the 10s poll); (2) TrayView gains eco_disabled (eco entry greyed, not removed) and plans (degraded-mode 'Windows plan' section, enabled); TrayEvent gains SelectPlan. Menu visual verification remains on-device.

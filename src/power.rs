@@ -21,8 +21,14 @@ use windows_sys::Win32::System::SystemServices::{
     PROCESSOR_PERF_BOOST_MODE_DISABLED, PROCESSOR_PERF_BOOST_MODE_ENABLED,
 };
 
-/// The four Nitro plan names, in profile order (quiet, balanced, performance, eco).
-pub const NITRO_PLANS: [&str; 4] = ["Nitro-Quiet", "Nitro-Balanced", "Nitro-Performance", "Nitro-Eco"];
+/// The four Nitro plan names, in profile order (quiet, balanced, performance,
+/// eco) — derived from the policy mapping so the two tables cannot drift.
+pub const NITRO_PLANS: [&str; 4] = [
+    Profile::Quiet.plan_name(),
+    Profile::Balanced.plan_name(),
+    Profile::Performance.plan_name(),
+    Profile::Eco.plan_name(),
+];
 
 /// Profiles in the same order as `NITRO_PLANS`.
 const PROFILES: [Profile; 4] = [Profile::Quiet, Profile::Balanced, Profile::Performance, Profile::Eco];
