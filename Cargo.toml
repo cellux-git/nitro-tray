@@ -1,0 +1,39 @@
+[package]
+name = "nitro-tray"
+version = "0.1.0"
+edition = "2024"
+description = "Single portable exe that enforces a coherent power state on Acer Nitro laptops"
+rust-version = "1.85"
+
+[lib]
+name = "nitro_tray"
+path = "src/lib.rs"
+
+[[bin]]
+name = "nitro-tray"
+path = "src/main.rs"
+
+[dependencies]
+toml = "0.8"
+windows-sys = { version = "0.60", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Com",
+    "Win32_System_Ole",
+    "Win32_System_Power",
+    "Win32_System_Registry",
+    "Win32_System_SystemInformation",
+    "Win32_System_SystemServices",
+    "Win32_System_TaskScheduler",
+    "Win32_System_Threading",
+    "Win32_System_Wmi",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_Devices_HumanInterfaceDevice",
+    "Win32_Devices_DeviceAndDriverInstallation",
+    "Win32_Graphics_Gdi",
+] }
+
+[build-dependencies]
+embed-manifest = "1"
