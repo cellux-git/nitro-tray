@@ -57,6 +57,11 @@ const MENU_SMART_CHARGE: usize = 100;
 const MENU_PLAN_BASE: usize = 300;
 const MENU_QUIT: usize = 200;
 const ICON_SIZE: i32 = 16;
+/// `Shell_NotifyIconW NIM_ADD` retries: at logon the scheduled task can start
+/// before Explorer's notification area is up, and NIM_ADD then fails once.
+/// Retry every second for up to 10 attempts.
+const NIM_ADD_ATTEMPTS: u32 = 10;
+const NIM_ADD_RETRY_MS: u64 = 1_000;
 
 /// GUID_ACDC_POWER_SOURCE; not shipped by windows-sys, hardcoded per spec
 /// (5d3e9a59-e9d5-4b00-a6bd-ff34ff516548).
@@ -198,7 +203,19 @@ impl Tray {
                 return Err(TrayError::Create("icon creation failed"));
             };
             let nid = nid_template(hwnd, icon);
-            if Shell_NotifyIconW(NIM_ADD, &nid) == 0 {
+            let mut added = false;
+            for attempt in 0..NIM_ADD_ATTEMPTS {
+                if Shell_NotifyIconW(NIM_ADD, &nid) != 0 {
+                    added = true;
+                    break;
+                }
+                log::warn(format!(
+                    "Shell_NotifyIconW NIM_ADD failed (attempt {}); retrying",
+                    attempt + 1
+                ));
+                std::thread::sleep(std::time::Duration::from_millis(NIM_ADD_RETRY_MS));
+            }
+            if !added {
                 destroy_icon_assets(icon, bitmap, mask);
                 destroy_window(hwnd);
                 return Err(TrayError::Create("Shell_NotifyIconW NIM_ADD failed"));
