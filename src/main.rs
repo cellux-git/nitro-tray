@@ -38,8 +38,10 @@ fn main() {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
 
+    let config = config::load(&exe_dir);
+
     log::init(&exe_dir);
-    if debug_log {
+    if debug_log || config.log {
         log::set_enabled(true);
     }
     log::info("nitro-tray starting");

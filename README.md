@@ -77,6 +77,7 @@ the exe as `nitro-tray.toml` and edit.
 | `reapply` | bool | `false` | Periodic firmware re-assertion loop |
 | `reapply_interval_secs` | integer | `30` | Loop interval (seconds) |
 | `hotkey` | string | `"ctrl-alt-p"` | Global hotkey: `ctrl\|alt\|shift\|win` modifiers + key (`a`–`z`, `0`–`9`, `f1`–`f24`) |
+| `log` | bool | `false` | Debug log to `nitro-tray.log` beside the exe (the `--log` flag enables it per launch) |
 
 Example `nitro-tray.toml`:
 
@@ -99,6 +100,9 @@ reapply_interval_secs = 30
 
 # Global hotkey: ctrl|alt|shift|win + key (a-z, 0-9, f1-f24)
 hotkey = "ctrl-alt-p"
+
+# Debug log to nitro-tray.log beside the exe (or launch with --log)
+log = false
 ```
 
 ## Command line
