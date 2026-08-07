@@ -1,17 +1,19 @@
 //! Smart-charge adapter: in-process control of the 80% charge cap via the
-//! `BatteryControl` WMI health-status toggle, using the AMD direct-trust
-//! write path for the target SKU class (see
+//! `BatteryControl` WMI health-status toggle. Single-SKU target: the
+//! AN16S-61 — the write path is the mask-2 tuple verified live on this
+//! machine (2026-08-08). The prior-art "direct-trust" tuple `(1,1,status)`
+//! is deliberately absent: on the AN16S-61 it clears the health byte even
+//! when requesting status 1 (the historical table lives in
 //! `.scratch/nitro-tray/prior-art-aeroforge.md`). No interpreter is spawned.
 //! In-process MI (`mi.dll`) via the shared `mi` module, bound to the
 //! provider-enumerated instance (ticket 16).
 //!
-//! No sweeping, ever: the readback is a single direct-trust pair (battery 1,
-//! function query 1), never the 35-call `uBatteryNo` x `uFunctionQuery`
-//! sweep. A full-sweep discovery mode is deliberately absent; if a future
-//! machine needs it, that is a config/decision point, not a default.
+//! No sweeping, ever: the readback is a single pair (battery 1, function
+//! query 1), never the 35-call `uBatteryNo` x `uFunctionQuery` sweep. A
+//! full-sweep discovery mode is deliberately absent; if a future machine
+//! needs it, that is a config/decision point, not a default.
 
 use std::cell::Cell;
-use std::time::Duration;
 
 use crate::log;
 use crate::mi::{MiConnection, MiError, MI_RESULT_ACCESS_DENIED, MI_RESULT_INVALID_CLASS, MI_RESULT_NOT_FOUND};
@@ -47,27 +49,13 @@ const CLASS_NAME: &str = "BatteryControl";
 const METHOD_SET: &str = "SetBatteryHealthControl";
 const METHOD_GET: &str = "GetBatteryHealthControlStatus";
 
-/// Delay between fallback write attempts (prior art: 250 ms).
-const ATTEMPT_DELAY: Duration = Duration::from_millis(250);
-
-/// Encodes the AMD direct-trust write tuple for the target SKU class
-/// (`uBatteryNo=1, uFunctionMask=1, uFunctionStatus=status`, 5-zero reserved).
-/// Prior-art §3.2; attempted first, reported immediately on success.
-pub fn direct_trust_tuple(status: u8) -> (u8, u8, u8, [u8; 5]) {
-    (1, 1, status, [0, 0, 0, 0, 0])
-}
-
-/// Ordered fallback write tuples (prior-art §3.3, battery 1 before battery 0,
-/// masks 2 then 3; the mask-1 legacy tuples are subsumed by the direct path).
-/// The first whose `ExecMethod` reports a truthy `ReturnValue` wins.
-pub fn fallback_tuples(status: u8) -> Vec<(u8, u8, u8, [u8; 5])> {
-    vec![
-        (1, 2, status, [0, 0, 0, 0, 0]),
-        (1, 3, status, [0, 0, 0, 0, 0]),
-        (0, 1, status, [0, 0, 0, 0, 0]),
-        (0, 2, status, [0, 0, 0, 0, 0]),
-        (0, 3, status, [0, 0, 0, 0, 0]),
-    ]
+/// Encodes the AN16S-61 smart-charge write tuple (`uBatteryNo=1,
+/// uFunctionMask=2, uFunctionStatus=status`, 5-zero reserved). Verified live
+/// via the MI stack (2026-08-08): mask 2 sets/clears the health-status byte
+/// (index 1) that the single-pair readback reads. The prior-art mask-1 tuple
+/// is not used — on this machine it writes the wrong bit.
+pub fn write_tuple(status: u8) -> (u8, u8, u8, [u8; 5]) {
+    (1, 2, status, [0, 0, 0, 0, 0])
 }
 
 /// Decodes the health-status byte from readback rows. Prefers the
@@ -157,59 +145,54 @@ impl SmartChargeAdapter {
         result
     }
 
-    /// Toggle the 80% charge cap via the AMD direct-trust write path
-    /// (`SetBatteryHealthControl` with the proven tuple).
+    /// Toggle the 80% charge cap via the AN16S-61 write tuple
+    /// (`SetBatteryHealthControl`, mask 2). Success requires the readback
+    /// match; a lying or rejected write is an error (the minute tick retries
+    /// on the next readback).
     pub fn set_enabled(&self, enabled: bool) -> Result<(), ChargeError> {
         self.guarded(|| {
             let status = u8::from(enabled);
-            let mut attempts: Vec<(u8, u8, u8, [u8; 5])> = vec![direct_trust_tuple(status)];
-            attempts.extend(fallback_tuples(status));
-            let mut last_rejected: Option<u32> = None;
-            let mut last_error: Option<ChargeError> = None;
-            for (battery, mask, status_byte, _reserved) in attempts {
-                match self.exec_set(battery, mask, status_byte) {
-                    Ok(Some(return_value)) if method_succeeded(0, Some(return_value)) => {
-                        // Prior-art §3.4: a truthy ReturnValue alone is not
-                        // proof of effect. On the AN16S-61 the direct-trust
-                        // tuple (1,1,status) is accepted with ReturnValue=1
-                        // yet clears the health bit (verified live,
-                        // 2026-08-08) — the readback match is what decides.
-                        std::thread::sleep(ATTEMPT_DELAY);
-                        match self.verify_status(READBACK_BATTERY, READBACK_QUERY, status) {
-                            Ok(true) => return Ok(()),
-                            Ok(false) => {
-                                last_rejected = Some(return_value);
-                            }
-                            Err(e) => last_error = Some(e),
-                        }
-                    }
-                    Ok(Some(return_value)) => last_rejected = Some(return_value),
-                    Ok(None) => last_rejected = Some(0),
-                    Err(e) => last_error = Some(e),
+            let (battery, mask, status_byte, _reserved) = write_tuple(status);
+            let return_value = match self.exec_set(battery, mask, status_byte) {
+                Ok(Some(value)) => value,
+                Ok(None) => {
+                    return Err(ChargeError::Unexpected(format!(
+                        "SetBatteryHealthControl ({battery},{mask},{status_byte}): no ReturnValue"
+                    )));
                 }
-                std::thread::sleep(ATTEMPT_DELAY);
+                Err(e) => return Err(e),
+            };
+            if !method_succeeded(0, Some(return_value)) {
+                return Err(ChargeError::Unexpected(format!(
+                    "SetBatteryHealthControl ({battery},{mask},{status_byte}) rejected (ReturnValue={return_value})"
+                )));
             }
-            match last_error {
-                Some(e) => Err(e),
-                None => Err(ChargeError::Unexpected(format!(
-                    "provider rejected every SetBatteryHealthControl tuple (last ReturnValue={})",
-                    last_rejected.unwrap_or(0)
+            // Prior-art §3.4: a truthy ReturnValue alone is not proof of
+            // effect (on the AN16S-61 the dropped (1,1,*) tuple accepted
+            // status=1 yet cleared the health bit) — the readback match is
+            // what decides. The write applies synchronously: immediate
+            // readback verified 10/10 on this machine (2026-08-08).
+            match self.verify_status(READBACK_BATTERY, READBACK_QUERY, status) {
+                Ok(true) => Ok(()),
+                Ok(false) => Err(ChargeError::Unexpected(format!(
+                    "SetBatteryHealthControl ({battery},{mask},{status_byte}) accepted but readback did not match (ReturnValue={return_value})"
                 ))),
+                Err(e) => Err(e),
             }
         })
     }
 
     /// Read back the current smart-charge state
-    /// (`GetBatteryHealthControlStatus`): one direct-trust pair (battery 1,
-    /// query 1), decoded with the prior-art preference (function-list bit 1,
-    /// status byte index 1). No sweeping; a rejected or empty row degrades to
-    /// an error (the caller shows `None`).
+    /// (`GetBatteryHealthControlStatus`): one single-pair readback (battery
+    /// 1, query 1), decoded with the prior-art preference (function-list bit
+    /// 1, status byte index 1). No sweeping; a rejected or empty row degrades
+    /// to an error (the caller shows `None`).
     pub fn is_enabled(&self) -> Result<bool, ChargeError> {
         self.guarded(|| {
             let status = self.read_status(READBACK_BATTERY, READBACK_QUERY)?;
             status.ok_or_else(|| {
                 ChargeError::Unexpected(
-                    "no GetBatteryHealthControlStatus row for the direct-trust pair".into(),
+                    "no GetBatteryHealthControlStatus row for the (battery 1, query 1) pair".into(),
                 )
             })
         })
@@ -228,7 +211,7 @@ impl SmartChargeAdapter {
     }
 
     /// Prior-art §3.4 write verification: the health-status byte read back
-    /// for the direct-trust pair must equal the requested status.
+    /// for the readback pair must equal the requested status.
     fn verify_status(&self, battery: u8, query: u8, requested: u8) -> Result<bool, ChargeError> {
         match self.read_status(battery, query)? {
             Some(actual) => Ok(actual == (requested == 1)),
@@ -303,25 +286,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn direct_trust_tuple_encodes_prior_art_anv16_41_path() {
-        assert_eq!(direct_trust_tuple(1), (1, 1, 1, [0, 0, 0, 0, 0]));
-        assert_eq!(direct_trust_tuple(0), (1, 1, 0, [0, 0, 0, 0, 0]));
-    }
-
-    #[test]
-    fn fallback_tuples_are_ordered_and_scalar() {
-        let expected: Vec<(u8, u8, u8, [u8; 5])> = vec![
-            (1, 2, 1, [0, 0, 0, 0, 0]),
-            (1, 3, 1, [0, 0, 0, 0, 0]),
-            (0, 1, 1, [0, 0, 0, 0, 0]),
-            (0, 2, 1, [0, 0, 0, 0, 0]),
-            (0, 3, 1, [0, 0, 0, 0, 0]),
-        ];
-        assert_eq!(fallback_tuples(1), expected);
-        for (_, _, status, reserved) in fallback_tuples(0) {
-            assert_eq!(status, 0);
-            assert_eq!(reserved, [0, 0, 0, 0, 0]);
-        }
+    fn write_tuple_encodes_the_an16s_61_verified_path() {
+        assert_eq!(write_tuple(1), (1, 2, 1, [0, 0, 0, 0, 0]));
+        assert_eq!(write_tuple(0), (1, 2, 0, [0, 0, 0, 0, 0]));
     }
 
     #[test]

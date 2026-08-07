@@ -29,6 +29,11 @@ pub const SETTING_PLATFORM_PROFILE: u32 = 0x0B;
 /// `SetGamingFanBehavior` value for fan mode AUTO.
 pub const FAN_AUTO: u32 = 0x0041_0009;
 
+/// 16-byte `SetGamingKBBacklight` config that turns the keyboard backlight
+/// off: mode 0 (static), brightness 0, byte 9 (apply flag) 1, rest zero
+/// (see `.scratch/nitro-tray/keyboard-leds.md`).
+pub const KEYBOARD_BACKLIGHT_OFF: [u8; 16] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0];
+
 /// Errors from the WMI layer.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WmiError {
@@ -136,23 +141,46 @@ impl WmiAdapter {
         Ok(output as u32)
     }
 
+    /// Turn the keyboard backlight off (`SetGamingKBBacklight` with the
+    /// 16-byte off config; the only config this app ever writes — when the
+    /// user opts out, the keyboard lighting is left untouched).
+    pub fn set_keyboard_backlight_off(&self) -> Result<(), WmiError> {
+        self.exec_method_array("SetGamingKBBacklight", &KEYBOARD_BACKLIGHT_OFF)
+    }
+
     fn exec_method(&self, method: &'static str, input: u64) -> Result<Option<u64>, WmiError> {
         if self.dead.get() {
             return Err(WmiError::NotAvailable);
         }
         let result = self.exec_method_inner(method, input);
-        match &result {
-            Ok(_) => self.failures.set(0),
-            Err(_) => {
-                let count = self.failures.get() + 1;
-                self.failures.set(count);
-                if count >= MAX_ADAPTER_FAILURES {
-                    self.dead.set(true);
-                    log::warn("wmi: adapter disabled after repeated failures; running degraded");
-                }
+        self.track(result.is_ok());
+        result
+    }
+
+    /// Same as `exec_method` for methods whose `gmInput` is a byte array
+    /// (`SetGamingKBBacklight` declares `gmInput: UInt8Array`).
+    fn exec_method_array(&self, method: &'static str, input: &[u8]) -> Result<(), WmiError> {
+        if self.dead.get() {
+            return Err(WmiError::NotAvailable);
+        }
+        let result = self.exec_method_array_inner(method, input);
+        self.track(result.is_ok());
+        result
+    }
+
+    /// Circuit-breaker bookkeeping: reset on success, count up on failure and
+    /// disable the adapter at the threshold.
+    fn track(&self, ok: bool) {
+        if ok {
+            self.failures.set(0);
+        } else {
+            let count = self.failures.get() + 1;
+            self.failures.set(count);
+            if count >= MAX_ADAPTER_FAILURES {
+                self.dead.set(true);
+                log::warn("wmi: adapter disabled after repeated failures; running degraded");
             }
         }
-        result
     }
 
     /// One instance-bound MI invocation: enumerate the provider's first
@@ -186,6 +214,17 @@ impl WmiAdapter {
     /// (MI is not subject to the WBEM-COM bad windows, ticket 16).
     fn enumerate_instance(&self) -> Result<MiInstance, WmiError> {
         self.connection.enumerate_first_instance(NAMESPACE, CLASS_NAME).map_err(map_mi)
+    }
+
+    /// One instance-bound MI invocation with a byte-array `gmInput` (the
+    /// `SetGamingKBBacklight` parameter is declared `UInt8Array`). The
+    /// out-params instance is discarded — writes are not read back.
+    fn exec_method_array_inner(&self, method: &'static str, input: &[u8]) -> Result<(), WmiError> {
+        let instance = self.enumerate_instance()?;
+        let mut input_bag = self.connection.new_instance(CLASS_NAME).map_err(map_mi)?;
+        input_bag.add_u8_array(IN_PARAM, input).map_err(map_mi)?;
+        self.connection.invoke(NAMESPACE, &instance, method, &input_bag).map_err(map_mi)?;
+        Ok(())
     }
 }
 
@@ -243,6 +282,14 @@ mod tests {
         assert_eq!(PROFILE_ECO, 6);
         assert_eq!(FAN_AUTO, 0x0041_0009);
         assert_eq!(SETTING_PLATFORM_PROFILE, 0x0B);
+    }
+
+    #[test]
+    fn keyboard_off_payload_is_16_bytes_static_zero_brightness() {
+        assert_eq!(KEYBOARD_BACKLIGHT_OFF.len(), 16);
+        assert_eq!(KEYBOARD_BACKLIGHT_OFF[0], 0); // mode: static
+        assert_eq!(KEYBOARD_BACKLIGHT_OFF[2], 0); // brightness: off
+        assert_eq!(KEYBOARD_BACKLIGHT_OFF[9], 1); // apply flag
     }
 
     #[test]

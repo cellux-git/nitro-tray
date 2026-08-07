@@ -6,7 +6,10 @@
 //!
 //! A separate once-a-minute readback tick re-reads the targeted state
 //! (single profile read, single-pair smart-charge read, plan read) so a quiet
-//! session — no events at all — cannot leave the tray view stale.
+//! session — no events at all — cannot leave the tray view stale. The tick
+//! also re-enables smart charge when the readback finds the cap off, so a
+//! silent external disable is corrected within a minute even when the
+//! reapply loop (off by default) is not running.
 //!
 //! Both timers are always armed; recovery must not depend on the reapply
 //! loop, which is off by default.

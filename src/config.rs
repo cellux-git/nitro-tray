@@ -24,6 +24,10 @@ pub struct Config {
     pub reapply_interval_secs: u64,
     /// Global hotkey spec; default `"ctrl-alt-p"`.
     pub hotkey: String,
+    /// Turn the keyboard backlight off on every apply (startup, power
+    /// transitions, profile change, resume, reapply ticks); default `true`.
+    /// `false` leaves the keyboard lighting completely untouched.
+    pub keyboard_led_off: bool,
     /// Debug log to `nitro-tray.log` beside the exe; default `false` (the
     /// `--log` command-line flag enables it per launch).
     pub log: bool,
@@ -38,6 +42,7 @@ impl Default for Config {
             reapply: false,
             reapply_interval_secs: 30,
             hotkey: "ctrl-alt-p".to_string(),
+            keyboard_led_off: true,
             log: false,
         }
     }
@@ -130,6 +135,17 @@ pub fn parse(contents: &str) -> (Config, Vec<String>) {
         }
     }
 
+    if let Some(value) = table.get("keyboard_led_off") {
+        match value.as_bool() {
+            Some(b) => cfg.keyboard_led_off = b,
+            None => diagnostics.push(bad_value(
+                "keyboard_led_off",
+                "expected boolean",
+                cfg.keyboard_led_off,
+            )),
+        }
+    }
+
     if let Some(value) = table.get("log") {
         match value.as_bool() {
             Some(b) => cfg.log = b,
@@ -199,6 +215,7 @@ mod tests {
              reapply = true\n\
              reapply_interval_secs = 120\n\
              hotkey = \"ctrl-alt-f\"\n\
+             keyboard_led_off = false\n\
              log = true\n",
         );
         assert_eq!(cfg.ac_profile, "performance");
@@ -207,6 +224,7 @@ mod tests {
         assert!(cfg.reapply);
         assert_eq!(cfg.reapply_interval_secs, 120);
         assert_eq!(cfg.hotkey, "ctrl-alt-f");
+        assert!(!cfg.keyboard_led_off);
         assert!(cfg.log);
         assert!(diags.is_empty());
     }
@@ -220,16 +238,18 @@ mod tests {
              reapply = \"on\"\n\
              reapply_interval_secs = \"30\"\n\
              hotkey = 7\n\
+             keyboard_led_off = \"yes\"\n\
              log = \"yes\"\n",
         );
         assert_eq!(cfg, Config::default());
-        assert_eq!(diags.len(), 7);
+        assert_eq!(diags.len(), 8);
         assert!(diags.iter().any(|d| d.contains("'ac_profile'") && d.contains("expected string") && d.contains("default \"balanced\"")));
         assert!(diags.iter().any(|d| d.contains("'battery_profile'") && d.contains("expected string") && d.contains("default \"eco\"")));
         assert!(diags.iter().any(|d| d.contains("'auto_switch'") && d.contains("expected boolean") && d.contains("default true")));
         assert!(diags.iter().any(|d| d.contains("'reapply'") && d.contains("expected boolean") && d.contains("default false")));
         assert!(diags.iter().any(|d| d.contains("'reapply_interval_secs'") && d.contains("expected integer") && d.contains("default 30")));
         assert!(diags.iter().any(|d| d.contains("'hotkey'") && d.contains("expected string") && d.contains("default \"ctrl-alt-p\"")));
+        assert!(diags.iter().any(|d| d.contains("'keyboard_led_off'") && d.contains("expected boolean") && d.contains("default true")));
         assert!(diags.iter().any(|d| d.contains("'log'") && d.contains("expected boolean") && d.contains("default false")));
     }
 
@@ -278,14 +298,16 @@ mod tests {
     #[test]
     fn load_partial_file_applies_overrides() {
         let dir = temp_dir("load-partial");
-        std::fs::write(dir.join(CONFIG_FILE_NAME), "reapply = true\nhotkey = \"ctrl-alt-shift-x\"").unwrap();
+        std::fs::write(dir.join(CONFIG_FILE_NAME), "reapply = true\nhotkey = \"ctrl-alt-shift-x\"\nkeyboard_led_off = false").unwrap();
         let cfg = load(&dir);
         remove_dir(&dir);
         assert!(cfg.reapply);
         assert_eq!(cfg.hotkey, "ctrl-alt-shift-x");
+        assert!(!cfg.keyboard_led_off);
         assert_eq!(cfg, Config {
             reapply: true,
             hotkey: "ctrl-alt-shift-x".to_string(),
+            keyboard_led_off: false,
             ..Config::default()
         });
     }

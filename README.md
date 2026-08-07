@@ -31,8 +31,10 @@ coherent power state:
 - firmware platform profile (via Acer WMI),
 - Acer HID usage mode,
 - fan behavior **auto**,
-- smart charge (80% charge cap — always enforced on, best effort, cannot be
-  disabled),
+- keyboard backlight **off** (configurable — see `keyboard_led_off`),
+- smart charge (80% charge cap — applied at startup and re-enabled by the
+  once-a-minute check whenever it reads off; never written on profile
+  changes),
 - the active Windows power plan.
 
 Profiles are chosen independently per power state:
@@ -55,9 +57,9 @@ Additional behavior:
   current power state's profile list, with a balloon notification. Automatic
   switching stays silent — no notifications.
 - An optional periodic re-assertion loop re-applies the firmware-level items
-  (WMI profile, HID mode, fan auto, smart-charge state) and **never** touches
-  the active Windows plan, so manually chosen plans are respected. Off by
-  default.
+  (WMI profile, HID mode, fan auto, keyboard backlight) and **never** touches
+  smart charge or the active Windows plan, so manually chosen plans are
+  respected. Off by default.
 - Quitting leaves the current profile and plan in place.
 
 ### Degraded mode
@@ -68,7 +70,9 @@ switching is offered. Degraded is not permanent: the app retries the
 interface every 30 seconds and re-applies the intended state as soon as it
 returns, so "Hardware unavailable" clears by itself. The tray also re-reads
 the effective state once a minute, so it cannot show stale values during a
-quiet session.
+quiet session — and that same minute tick re-enables smart charge if the
+readback ever finds the cap off, so a silent external disable is corrected
+within a minute even with the reapply loop off.
 
 ## Configuration
 
@@ -86,6 +90,7 @@ the exe as `nitro-tray.toml` and edit.
 | `reapply` | bool | `false` | Periodic firmware re-assertion loop |
 | `reapply_interval_secs` | integer | `30` | Loop interval (seconds) |
 | `hotkey` | string | `"ctrl-alt-p"` | Global hotkey: `ctrl\|alt\|shift\|win` modifiers + key (`a`–`z`, `0`–`9`, `f1`–`f24`) |
+| `keyboard_led_off` | bool | `true` | Turn the keyboard backlight off on every apply (startup, power transitions, profile change, resume); `false` leaves keyboard lighting untouched |
 | `log` | bool | `false` | Debug log to `nitro-tray.log` beside the exe (the `--log` flag enables it per launch) |
 
 Smart charge (80% charge cap) is always enforced on and cannot be configured.
@@ -110,6 +115,11 @@ reapply_interval_secs = 30
 
 # Global hotkey: ctrl|alt|shift|win + key (a-z, 0-9, f1-f24)
 hotkey = "ctrl-alt-p"
+
+# Turn the keyboard backlight off on every apply (startup, power
+# transitions, profile change, resume). Set to false to leave keyboard
+# lighting untouched.
+keyboard_led_off = true
 
 # Debug log to nitro-tray.log beside the exe (or launch with --log)
 log = false
@@ -185,6 +195,11 @@ cargo test          # unit tests (policy engine, config, encodings, ...)
 cargo clippy        # lints; the project is clippy-clean
 ```
 
+`cargo test` is a pure unit-test suite: it exercises encodings, policy, and
+config parsing only and never connects to hardware, reads, or writes
+firmware or power-plan state. It is safe to run on any machine, including a
+live target laptop.
+
 ### Probe binaries
 
 The build also produces elevated, on-device hardware diagnostic binaries
@@ -192,6 +207,14 @@ The build also produces elevated, on-device hardware diagnostic binaries
 `probe_power.exe`, plus `probe_mi.exe` for the MI transport and
 `probe_com_shapes.exe`, the COM-side diagnostic). Run them **elevated on the
 target laptop** to verify the hardware paths (see [Development](#development)).
+
+**The probes are state-changing, unlike the test suite.** They are not
+read-only: `probe_wmi` cycles the firmware platform profile, `probe_charge`
+and `probe_mi` toggle the smart-charge cap (restoring it afterwards),
+`probe_hid` writes the usage mode, and `probe_power` activates power plans.
+They are separate executables that are never invoked by the app, the test
+suite, or any build step — run them manually on the target machine only, and
+expect firmware/OS state to change while they run.
 
 ### Run the freshly built exe
 
@@ -223,6 +246,10 @@ Probe binaries (run **elevated, on-device** for hardware verification):
 - `probe_power` — power plan detection / activation / CPU tuning
 - `probe_mi` — raw `mi.dll` transport diagnostics (BatteryControl rows, write tuples)
 - `probe_com_shapes` — legacy WBEM-COM diagnostic (kept for transport investigations)
+
+Every probe writes to the hardware or OS state it inspects (see
+[Probe binaries](#probe-binaries)); only `probe_com_shapes` is read-only.
+`cargo test` runs none of them.
 
 Hardware paths (WMI, HID, charge, power APIs) cannot be meaningfully verified
 off-device: on-device verification of these paths is required before relying on

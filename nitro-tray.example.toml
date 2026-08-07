@@ -19,7 +19,8 @@ battery_profile = "eco"
 auto_switch = true
 
 # Periodic firmware re-assertion loop (WMI profile, HID mode, fan auto,
-# smart-charge state). Never touches the active Windows plan. Off by default.
+# keyboard backlight). Never touches smart charge, the active Windows plan.
+# Off by default.
 reapply = false
 
 # Re-assertion loop interval in seconds (>= 1).
@@ -28,6 +29,10 @@ reapply_interval_secs = 30
 # Global hotkey: ctrl|alt|shift|win modifiers + key (a-z, 0-9, f1-f24),
 # joined with "-". Cycle forward through the current power state's profiles.
 hotkey = "ctrl-alt-p"
+
+# Turn the keyboard backlight off on every apply (startup, power transitions,
+# profile change, resume). Set to false to leave keyboard lighting untouched.
+keyboard_led_off = true
 
 # Debug log to nitro-tray.log next to the exe. Off by default; the --log
 # command-line flag enables it per launch regardless of this setting.

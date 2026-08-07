@@ -91,8 +91,12 @@ structure flat: one event-dispatch match, one set of `app` calls, one
    adapters with a fresh COM stack, re-runs enforcement, and the tray view
    clears by itself.
 5. **Apply path (AppCore)**: full apply = WMI profile (if available), HID
-   usage mode (log-only on failure), fan auto (WMI), smart charge, active
-   plan. HID failure is never fatal.
+   usage mode (log-only on failure), fan auto (WMI), keyboard backlight off
+   (config-gated), active plan. HID failure is never fatal. **Smart charge
+   is written on exactly two occasions**: application start
+   (`apply_smart_charge`) and the once-a-minute readback tick
+   (`reassert_smart_charge`, write only when the readback says off) — profile
+   changes, power transitions, resume, and reapply ticks never touch it.
 6. **Silence**: automatic switching (startup/transitions/resume/reapply)
    produces no notifications. Only the hotkey path calls `tray.notify(...)`.
 7. **In-process only**: never spawn PowerShell, `powercfg`, `schtasks`, or any
@@ -118,8 +122,8 @@ IntendedState, PolicyEngine, AC_PROFILES, BATTERY_PROFILES}`,
 (NITRO_PLANS is derived from `Profile::plan_name` — single source of truth),
 `wmi::{WmiAdapter, WmiError, PROFILE_*, FAN_AUTO, SETTING_PLATFORM_PROFILE}`,
 `hid::{HidAdapter, HidError, usage_mode_report, usage_mode_from_selector}`,
-`charge::{SmartChargeAdapter, ChargeError, direct_trust_tuple,
-fallback_tuples, desired_status_from_rows, method_succeeded}` (a set attempt
+`charge::{SmartChargeAdapter, ChargeError, write_tuple,
+desired_status_from_rows, method_succeeded}` (a set attempt
 only counts as success with a present, truthy, non-error `ReturnValue`),
 `power_state::{read, PowerStateSnapshot, SLOW_POLL_MS}`,
 `tray::{Tray, TrayView, TrayEvent, TrayError}` (TrayView also carries

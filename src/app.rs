@@ -1,6 +1,7 @@
 //! Application core: wires config + policy engine + adapters. Owns the apply
-//! path (firmware profile, HID usage mode, fan auto, smart charge, plan),
-//! runtime eco acceptance detection, per-power-state pick persistence
+//! path (firmware profile, HID usage mode, fan auto, keyboard backlight off,
+//! plan), the startup + minute-tick smart-charge occasions, runtime eco
+//! acceptance detection, per-power-state pick persistence
 //! (`nitro-tray.state.toml` beside the exe), and the read-back effective
 //! state. Degrades gracefully when the Acer WMI interface is unreachable;
 //! unavailable adapters are reconnected by the recovery loop, never terminal.
@@ -56,6 +57,8 @@ pub struct AppCore {
     wmi_retry_logged: bool,
     /// Same as `wmi_retry_logged`, for the smart-charge adapter.
     charge_retry_logged: bool,
+    /// Turn the keyboard backlight off on every apply (config, default true).
+    keyboard_led_off: bool,
 }
 
 impl AppCore {
@@ -108,6 +111,7 @@ impl AppCore {
         AppCore {
             engine,
             auto_switch: config.auto_switch,
+            keyboard_led_off: config.keyboard_led_off,
             wmi,
             charge,
             hid,
@@ -205,8 +209,9 @@ impl AppCore {
     }
 
     /// Full enforcement for the current power state, silently: ensure plans,
-    /// then apply the intended state (profile, HID, fan auto, smart charge,
-    /// plan). Used at startup, on power transitions, and on resume.
+    /// then apply the intended state (profile, HID, fan auto, keyboard
+    /// backlight, plan — never smart charge). Used at startup, on power
+    /// transitions, and on resume.
     pub fn enforce_now(&mut self) {
         self.ensure_nitro_plans();
         let snapshot = self.refresh_power();
@@ -214,11 +219,45 @@ impl AppCore {
     }
 
     /// Firmware-only re-assertion (reapply loop): WMI profile, HID mode, fan
-    /// auto, smart-charge state — never the active plan.
+    /// auto, keyboard backlight (config-gated) — never smart charge (that is
+    /// the startup apply + minute tick's job) and never the active plan.
     pub fn reapply_firmware(&mut self) {
         let snapshot = self.refresh_power();
         let intent = self.engine.reapply_intended(snapshot.state, self.eco_ok());
         self.apply_intended(&intent);
+    }
+
+    /// Once-a-minute smart-charge re-assertion (readback tick): when the cap
+    /// reads back off, re-enable it. The readback loop is always armed, so a
+    /// silent external disable is corrected within a minute even when the
+    /// reapply loop is off. Read errors are ignored (the recovery loop owns
+    /// reconnects).
+    pub fn reassert_smart_charge(&mut self) {
+        let Some(charge) = self.charge.as_ref() else { return };
+        if !charge.is_available() {
+            return;
+        }
+        match charge.is_enabled() {
+            Ok(true) => {}
+            Ok(false) => match charge.set_enabled(true) {
+                Ok(()) => log::info("charge: smart charge read back off; re-enabled"),
+                Err(err) => log::warn(format!("charge: failed to re-enable after readback off: {err:?}")),
+            },
+            Err(err) => log::warn(format!("charge: readback failed on re-assert tick: {err:?}")),
+        }
+    }
+
+    /// Smart charge at application start: one write enabling the 80% cap
+    /// (the other smart-charge occasion is the once-a-minute
+    /// `reassert_smart_charge`; everything else leaves it untouched).
+    pub fn apply_smart_charge(&mut self) {
+        match self.charge.as_ref() {
+            Some(charge) => match charge.set_enabled(true) {
+                Ok(()) => log::info("charge: smart charge enabled"),
+                Err(err) => log::warn(format!("charge: failed to enable smart charge: {err:?}")),
+            },
+            None => log::warn("charge: adapter unavailable at startup; smart charge not applied"),
+        }
     }
 
     /// Re-run eco acceptance detection (called on power transitions, on
@@ -403,15 +442,17 @@ impl AppCore {
     }
 
     /// Apply one intended state to the hardware/OS: WMI profile, HID usage
-    /// mode (log-only on failure, never fatal), fan auto, smart charge, and
-    /// the active plan. Every item is applied independently; failures are
-    /// logged, never abort the rest, and reported so the tray can show the
-    /// outcome. An item whose adapter is unavailable is reported as *not
-    /// applied* (never "Applied" and never a failure — the tray already shows
-    /// the degraded state). A `None` firmware target (eco rejected) is not an
-    /// item at all. Smart charge is always targeted on — it cannot be
-    /// disabled in the app — so every apply is a best-effort enable attempt
-    /// (writes are retried by the reapply loop when enabled).
+    /// mode (log-only on failure, never fatal), fan auto, keyboard backlight
+    /// off (config-gated), and the active plan. Smart charge is deliberately
+    /// absent: it is written only at application start
+    /// (`apply_smart_charge`) and re-enabled by the once-a-minute readback
+    /// tick when it reads off (`reassert_smart_charge`) — profile changes,
+    /// power transitions, resume, and reapply ticks never touch it. Every
+    /// item is applied independently; failures are logged, never abort the
+    /// rest, and reported so the tray can show the outcome. An item whose
+    /// adapter is unavailable is reported as *not applied* (never "Applied"
+    /// and never a failure — the tray already shows the degraded state). A
+    /// `None` firmware target (eco rejected) is not an item at all.
     fn apply_intended(&self, intent: &IntendedState) -> ApplyReport {
         let mut report = ApplyReport::default();
         if let Some(value) = intent.firmware_profile {
@@ -448,16 +489,17 @@ impl AppCore {
         } else {
             report.skipped.push("fan");
         }
-        if let Some(charge) = self.charge.as_ref() {
-            match charge.set_enabled(true) {
-                Ok(()) => log::info("charge: smart charge enabled"),
-                Err(err) => {
-                    log::warn(format!("charge: failed to enable smart charge: {err:?}"));
-                    report.failed.push("smart charge");
-                }
+        if self.keyboard_led_off {
+            match self.wmi.as_ref() {
+                Some(wmi) => match wmi.set_keyboard_backlight_off() {
+                    Ok(()) => log::info("wmi: keyboard backlight set off"),
+                    Err(err) => {
+                        log::warn(format!("wmi: failed to set keyboard backlight off: {err:?}"));
+                        report.failed.push("keyboard leds");
+                    }
+                },
+                None => report.skipped.push("keyboard leds"),
             }
-        } else {
-            report.skipped.push("smart charge");
         }
         if let Some(plan) = intent.plan {
             match PowerApi::set_active_plan(plan) {

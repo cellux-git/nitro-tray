@@ -6,12 +6,14 @@
 use crate::app::AppCore;
 use crate::log;
 
-/// Startup: ensure the four Nitro plans exist, then enforce the intended
-/// state for the current power state.
+/// Startup: ensure the four Nitro plans exist, enforce the intended state
+/// for the current power state, and apply smart charge (one of its two
+/// occasions — the other is the once-a-minute readback tick).
 pub fn on_startup(app: &mut AppCore) {
     log::info("enforcement: startup");
     app.ensure_nitro_plans();
     app.enforce_now();
+    app.apply_smart_charge();
 }
 
 /// AC <-> battery transition (only when `auto_switch` is enabled in config):

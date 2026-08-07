@@ -308,6 +308,9 @@ fn handle_event(app: &mut AppCore, tray: &Tray, ev: TrayEvent) {
             // Targeted state re-reads (single profile read, single-pair
             // smart-charge read, plan read) + view refresh; keeps a quiet
             // session from leaving stale or degraded-looking tray state.
+            // Smart charge reads back off -> re-enable (always armed, so a
+            // silent external disable is fixed within a minute).
+            app.reassert_smart_charge();
             if let Err(e) = tray.update(&view_from(app)) {
                 log::warn(format!("failed to update tray view: {e:?}"));
             }

@@ -1,7 +1,8 @@
 //! Optional periodic re-assertion loop (off by default; interval default 30s,
 //! both configurable). Re-asserts only firmware-level items — WMI profile,
-//! HID mode, fan auto, smart-charge state — and never the active Windows
-//! plan, so manually chosen plans are respected.
+//! HID mode, fan auto, keyboard backlight (config-gated) — and never smart
+//! charge (that is the startup apply + minute tick's job) and never the
+//! active Windows plan, so manually chosen plans are respected.
 
 use crate::app::AppCore;
 use crate::config::Config;
