@@ -1,12 +1,12 @@
-//! Binary entry point: arg parsing, single-instance mutex, logon-task
-//! install/uninstall, config + app core startup, tray creation, and the
-//! message pump that dispatches tray events.
+//! Binary entry point: single-instance mutex, logon-task install/removal
+//! (driven by the "Start at logon" state flag), config + app core startup,
+//! tray creation, and the message pump that dispatches tray events.
 
 #![windows_subsystem = "windows"]
 
 use std::ffi::OsString;
 use std::os::windows::ffi::OsStringExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::ptr;
 use std::sync::mpsc;
 
@@ -17,20 +17,19 @@ use windows_sys::Win32::System::Threading::CreateMutexW;
 use windows_sys::Win32::UI::WindowsAndMessaging::{DispatchMessageW, GetMessageW, PostQuitMessage, MSG};
 
 use nitro_tray::app::{apply_report_text, AppCore, ApplyReport};
+use nitro_tray::charge::SmartChargeAdapter;
 use nitro_tray::config;
-use nitro_tray::enforcement;
+use nitro_tray::hid::HidAdapter;
 use nitro_tray::hotkey::Hotkey;
 use nitro_tray::log;
-use nitro_tray::policy::{PowerState, Profile, AC_PROFILES, BATTERY_PROFILES};
-use nitro_tray::reapply;
-use nitro_tray::recovery;
+use nitro_tray::policy::Profile;
+use nitro_tray::power::PowerApi;
 use nitro_tray::task;
-use nitro_tray::tray::{Tray, TrayEvent, TrayView};
+use nitro_tray::timers;
+use nitro_tray::tray::{Tray, TrayError, TrayEvent, TrayView};
+use nitro_tray::wmi::WmiAdapter;
 
 fn main() {
-    let debug_log = std::env::args_os().skip(1).any(|a| a == "--log");
-    let uninstall = std::env::args_os().skip(1).any(|a| a == "--uninstall");
-
     let Some(exe_path) = executable_path() else {
         return; // cannot resolve our own location; nothing sensible to do
     };
@@ -42,7 +41,7 @@ fn main() {
     let config = config::load(&exe_dir);
 
     log::init(&exe_dir);
-    if debug_log || config.log {
+    if config.log {
         log::set_enabled(true);
     }
     log::info("nitro-tray starting");
@@ -59,15 +58,6 @@ fn main() {
         default_hook(info);
     }));
 
-    if uninstall {
-        log::info("uninstall requested");
-        match task::uninstall_logon_task() {
-            Ok(()) => log::info("scheduled task removed"),
-            Err(e) => log::error(format!("failed to remove scheduled task: {e:?}")),
-        }
-        return;
-    }
-
     let _single_instance = match acquire_single_instance() {
         Ok(handle) => handle,
         Err(()) => {
@@ -81,13 +71,46 @@ fn main() {
     log::info("config loaded");
     let hotkey_spec = config.hotkey.clone();
     let reapply_cfg = config.clone();
-    let mut app = AppCore::new(config, &exe_dir);
+    // Wire the production adapters here, across the core's seam: failures
+    // degrade to None (never crash), exactly as the pre-seam core did.
+    let wmi = match WmiAdapter::connect() {
+        Ok(adapter) => Some(adapter),
+        Err(err) => {
+            log::warn(format!("wmi: adapter unavailable; running degraded: {err:?}"));
+            None
+        }
+    };
+    let charge = match SmartChargeAdapter::connect() {
+        Ok(adapter) => Some(adapter),
+        Err(err) => {
+            log::warn(format!("charge: smart-charge adapter unavailable: {err:?}"));
+            None
+        }
+    };
+    let hid = match HidAdapter::open() {
+        Ok(adapter) => Some(adapter),
+        Err(err) => {
+            log::warn(format!("hid: usage-mode adapter unavailable: {err:?}"));
+            None
+        }
+    };
+    let mut app = AppCore::new(config, &exe_dir, wmi, charge, hid, PowerApi);
     log::info("app core initialized");
 
-    if let Err(e) = task::install_logon_task(&exe_path) {
-        log::warn(format!("failed to install logon task: {e:?}"));
+    // "Start at logon" (state file, default off): when on, make sure the
+    // scheduled task exists — also on every boot, so a deleted task is
+    // recreated. When off, make sure no task lingers (e.g. from an earlier
+    // version that auto-installed).
+    if app.start_at_logon() {
+        match task::install_logon_task(&exe_path) {
+            Ok(()) => log::info("logon task installed (start at logon)"),
+            Err(e) => log::warn(format!("failed to install logon task: {e:?}")),
+        }
     } else {
-        log::info("logon task installed");
+        match task::uninstall_logon_task() {
+            Ok(()) => log::info("logon task absent (start at logon off)"),
+            Err(e) => log::warn(format!("failed to remove stale logon task: {e:?}")),
+        }
     }
 
     let (event_tx, event_rx) = mpsc::channel();
@@ -95,7 +118,10 @@ fn main() {
         Ok(tray) => tray,
         Err(e) => {
             log::error(format!("failed to create tray: {e:?}"));
-            fatal(format!("failed to create tray: {e:?}"));
+            let TrayError::Create(message) = &e else {
+                unreachable!("Tray::create only returns TrayError::Create");
+            };
+            fatal(format!("Failed to create the tray icon:\n\n{message}"));
             return;
         }
     };
@@ -119,9 +145,9 @@ fn main() {
         }
     };
 
-    if reapply::enabled(&reapply_cfg) {
-        let interval = reapply::interval_ms(&reapply_cfg);
-        match tray.start_timer(reapply::TIMER_ID, interval) {
+    if timers::reapply_enabled(&reapply_cfg) {
+        let interval = timers::reapply_interval_ms(&reapply_cfg);
+        match tray.start_timer(timers::REAPPLY_TIMER_ID, interval) {
             Ok(()) => log::info(format!("reapply loop enabled; interval {interval} ms")),
             Err(err) => log::warn(format!("reapply: failed to arm timer: {err:?}")),
         }
@@ -129,23 +155,23 @@ fn main() {
 
     // Recovery and the periodic readback are always armed — broken adapters
     // must recover and the tray view must refresh even when reapply is off.
-    match tray.start_timer(recovery::TIMER_ID, recovery::INTERVAL_MS) {
-        Ok(()) => log::info(format!("recovery loop armed; interval {} ms", recovery::INTERVAL_MS)),
+    match tray.start_timer(timers::RECOVERY_TIMER_ID, timers::RECOVERY_INTERVAL_MS) {
+        Ok(()) => log::info(format!("recovery loop armed; interval {} ms", timers::RECOVERY_INTERVAL_MS)),
         Err(err) => log::warn(format!("recovery: failed to arm timer: {err:?}")),
     }
-    match tray.start_timer(recovery::READBACK_TIMER_ID, recovery::READBACK_INTERVAL_MS) {
+    match tray.start_timer(timers::READBACK_TIMER_ID, timers::READBACK_INTERVAL_MS) {
         Ok(()) => log::info(format!(
             "readback loop armed; interval {} ms",
-            recovery::READBACK_INTERVAL_MS
+            timers::READBACK_INTERVAL_MS
         )),
         Err(err) => log::warn(format!("recovery: failed to arm readback timer: {err:?}")),
     }
 
-    enforcement::on_startup(&mut app);
+    app.on_startup();
     log::info("startup enforcement complete");
 
     log::info("entering message pump");
-    message_pump(&tray, &mut app, &event_rx);
+    message_pump(&tray, &mut app, &event_rx, &exe_path);
     log::info("nitro-tray exiting");
 }
 
@@ -192,7 +218,7 @@ fn acquire_single_instance() -> Result<HANDLE, ()> {
 
 /// GetMessageW/DispatchMessageW loop; drains the tray event channel after
 /// each message and dispatches events through `handle_event`.
-fn message_pump(tray: &Tray, app: &mut AppCore, events: &mpsc::Receiver<TrayEvent>) {
+fn message_pump(tray: &Tray, app: &mut AppCore, events: &mpsc::Receiver<TrayEvent>, exe_path: &Path) {
     let mut msg = MSG::default();
     loop {
         let ret = unsafe { GetMessageW(&mut msg, ptr::null_mut(), 0, 0) };
@@ -205,46 +231,33 @@ fn message_pump(tray: &Tray, app: &mut AppCore, events: &mpsc::Receiver<TrayEven
         }
         unsafe { DispatchMessageW(&msg) };
         while let Ok(ev) = events.try_recv() {
-            handle_event(app, tray, ev);
+            handle_event(app, tray, ev, exe_path);
         }
     }
 }
 
-/// Build the tray view from the app's read-back effective state: profiles
-/// valid for the current power state (eco entry kept but greyed when the
-/// firmware rejected it), read-back values for the checked profile, smart
-/// charge and plan, and the degraded flags when the Acer WMI interface is
-/// unavailable — in that case the "Windows plan" section still offers plan
-/// switches for the current power state's profiles.
+/// Build the tray view from the app's read-back effective state: the raw
+/// facts (power, percent, effective profile, degraded/eco flags, smart-charge
+/// readback, plan, logon flag). The tray derives the menu contents itself.
 fn view_from(app: &AppCore) -> TrayView {
-    let effective = app.effective();
-    let profiles = match app.current_power() {
-        PowerState::Ac => AC_PROFILES.to_vec(),
-        PowerState::Battery => BATTERY_PROFILES.to_vec(),
-    };
-    let degraded = !app.wmi_available();
-    let plans = if degraded { profiles.clone() } else { Vec::new() };
-    // Read-back firmware profile; when WMI can't report it, the active
-    // Windows plan is still OS-truth and identifies the profile in effect.
-    let profile = effective
-        .profile
-        .or_else(|| effective.plan.as_deref().and_then(Profile::from_plan_name));
-    // Read-back smart-charge state; when the adapter can't report it, show
-    // the intent — smart charge is always intended on and cannot be disabled.
-    let smart_charge = effective.smart_charge.or(Some(true));
+    let e = app.effective();
     TrayView {
-        power: effective.power,
-        percent: effective.percent,
-        profile,
-        eco_disabled: app.eco_disabled(),
-        profiles,
-        profiles_greyed: degraded,
-        plans,
-        smart_charge,
-        plan: effective.plan,
+        power: e.power,
+        percent: e.percent,
+        // Read-back firmware profile; when WMI can't report it, the active
+        // Windows plan is still OS-truth and identifies the profile in effect.
+        profile: e
+            .profile
+            .or_else(|| e.plan.as_deref().and_then(Profile::from_plan_name)),
+        degraded: !e.wmi_available,
+        eco_disabled: e.eco_disabled,
+        // Raw read-back; the tray applies the "always intended on" fallback
+        // for the smart-charge menu check mark when the adapter can't report.
+        smart_charge: e.smart_charge,
+        plan: e.plan,
         // The status line is set by the user-action handlers only.
         status: None,
-        degraded,
+        start_at_logon: app.start_at_logon(),
     }
 }
 
@@ -261,12 +274,33 @@ fn update_with_status(app: &AppCore, tray: &Tray, report: &ApplyReport) {
 
 /// One flat event dispatch; later tickets add match arms here
 /// (Hotkey: ticket 11, ReapplyTick: ticket 13).
-fn handle_event(app: &mut AppCore, tray: &Tray, ev: TrayEvent) {
+fn handle_event(app: &mut AppCore, tray: &Tray, ev: TrayEvent, exe_path: &Path) {
     match ev {
         TrayEvent::Quit => {
             log::info("quit requested");
             // later tickets: unregister hotkey (11), destroy tray icon (08)
             unsafe { PostQuitMessage(0) };
+        }
+        TrayEvent::ToggleLogonTask => {
+            log::info("start-at-logon toggled");
+            let enable = !app.start_at_logon();
+            let outcome = if enable {
+                task::install_logon_task(exe_path)
+            } else {
+                task::uninstall_logon_task()
+            };
+            let mut report = ApplyReport::default();
+            match outcome {
+                Ok(()) => {
+                    app.set_start_at_logon(enable);
+                    log::info(format!("start at logon {}", if enable { "enabled" } else { "disabled" }));
+                }
+                Err(err) => {
+                    log::warn(format!("logon task: {err:?}"));
+                    report.failed.push("logon task");
+                }
+            }
+            update_with_status(app, tray, &report);
         }
         TrayEvent::SelectProfile(profile) => {
             log::info(format!("profile selected: {}", profile.as_str()));
@@ -275,14 +309,14 @@ fn handle_event(app: &mut AppCore, tray: &Tray, ev: TrayEvent) {
         }
         TrayEvent::PowerChanged => {
             log::info("power state changed");
-            enforcement::on_power_changed(app);
+            app.on_power_changed();
             if let Err(e) = tray.update(&view_from(app)) {
                 log::warn(format!("failed to update tray view: {e:?}"));
             }
         }
         TrayEvent::Resume => {
             log::info("system resumed");
-            enforcement::on_resume(app);
+            app.on_resume();
             if let Err(e) = tray.update(&view_from(app)) {
                 log::warn(format!("failed to update tray view: {e:?}"));
             }
@@ -294,10 +328,10 @@ fn handle_event(app: &mut AppCore, tray: &Tray, ev: TrayEvent) {
             tray.notify("Nitro Tray", &format!("Profile: {}", profile.as_str()));
         }
         TrayEvent::ReapplyTick => {
-            reapply::on_tick(app);
+            app.on_reapply_tick();
         }
         TrayEvent::RecoveryTick => {
-            if recovery::on_tick(app) {
+            if app.on_recovery_tick() {
                 log::info("recovery: adapter reconnected; enforcing and refreshing tray");
                 if let Err(e) = tray.update(&view_from(app)) {
                     log::warn(format!("failed to update tray view: {e:?}"));

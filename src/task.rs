@@ -1,7 +1,8 @@
-//! Scheduled-task lifecycle: the first elevated run installs a logon
-//! scheduled task (`NitroTray`, run only when the user is logged on, highest
-//! privileges) that launches the exe, giving a silent elevated start at
-//! logon. `--uninstall` removes the task. In-process COM only (ITaskService).
+//! Scheduled-task lifecycle: the "Start at logon" checkbox (persisted in the
+//! state file) installs a logon scheduled task (`NitroTray`, run only when
+//! the user is logged on, highest privileges) that launches the exe, giving
+//! a silent elevated start at logon. Unchecking removes it. In-process COM
+//! only (ITaskService).
 
 use std::ops::Deref;
 use std::os::windows::ffi::OsStrExt;

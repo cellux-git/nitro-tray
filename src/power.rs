@@ -228,6 +228,33 @@ fn tune_scheme(scheme: &GUID, tuning: CpuTuning) -> Result<(), PowerError> {
 
 pub struct PowerApi;
 
+/// The power-plan surface the app core consumes (ticket 05): behind this
+/// seam, `AppCore` tests run without touching the Win32 power APIs, which
+/// cannot run under `cargo test` and would manipulate the live system.
+/// Method shapes match `PowerApi`'s statics exactly.
+pub trait PlanApi {
+    /// Ensure the four Nitro plans exist (recreate deleted ones).
+    fn ensure_nitro_plans(&self) -> Result<(), PowerError>;
+    /// Activate the named plan.
+    fn set_active_plan(&self, plan: &str) -> Result<(), PowerError>;
+    /// Read back the friendly name of the currently active plan.
+    fn active_plan_name(&self) -> Result<String, PowerError>;
+}
+
+impl PlanApi for PowerApi {
+    fn ensure_nitro_plans(&self) -> Result<(), PowerError> {
+        PowerApi::ensure_nitro_plans()
+    }
+
+    fn set_active_plan(&self, plan: &str) -> Result<(), PowerError> {
+        PowerApi::set_active_plan(plan)
+    }
+
+    fn active_plan_name(&self) -> Result<String, PowerError> {
+        PowerApi::active_plan_name()
+    }
+}
+
 impl PowerApi {
     /// Ensure the four Nitro plans exist: for each missing plan, duplicate
     /// the Windows Balanced plan, rename it, and apply the spec's processor

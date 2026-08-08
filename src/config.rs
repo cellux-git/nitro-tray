@@ -28,8 +28,8 @@ pub struct Config {
     /// transitions, profile change, resume, reapply ticks); default `true`.
     /// `false` leaves the keyboard lighting completely untouched.
     pub keyboard_led_off: bool,
-    /// Debug log to `nitro-tray.log` beside the exe; default `false` (the
-    /// `--log` command-line flag enables it per launch).
+    /// Debug log to `nitro-tray.log` beside the exe; default `true` (set
+    /// `false` to disable).
     pub log: bool,
 }
 
@@ -43,7 +43,7 @@ impl Default for Config {
             reapply_interval_secs: 30,
             hotkey: "ctrl-alt-p".to_string(),
             keyboard_led_off: true,
-            log: false,
+            log: true,
         }
     }
 }
@@ -250,7 +250,15 @@ mod tests {
         assert!(diags.iter().any(|d| d.contains("'reapply_interval_secs'") && d.contains("expected integer") && d.contains("default 30")));
         assert!(diags.iter().any(|d| d.contains("'hotkey'") && d.contains("expected string") && d.contains("default \"ctrl-alt-p\"")));
         assert!(diags.iter().any(|d| d.contains("'keyboard_led_off'") && d.contains("expected boolean") && d.contains("default true")));
-        assert!(diags.iter().any(|d| d.contains("'log'") && d.contains("expected boolean") && d.contains("default false")));
+        assert!(diags.iter().any(|d| d.contains("'log'") && d.contains("expected boolean") && d.contains("default true")));
+    }
+
+    #[test]
+    fn log_defaults_on_but_can_be_disabled() {
+        assert!(Config::default().log);
+        let (cfg, diags) = parse("log = false");
+        assert!(!cfg.log);
+        assert!(diags.is_empty());
     }
 
     #[test]

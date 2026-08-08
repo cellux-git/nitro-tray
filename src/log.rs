@@ -1,6 +1,9 @@
-//! Debug logging: with `--log`, appends diagnostics to `nitro-tray.log`
-//! beside the exe. Without the flag, all calls are no-ops. Never blocks the
-//! message pump for long (line-buffered appends).
+//! Logging: appends diagnostics to `nitro-tray.log` beside the exe. On by
+//! default; the `log = false` config key disables it. INFO/WARN/ERROR lines
+//! are written whenever logging is enabled; DEBUG lines additionally require
+//! `set_debug` (off by default), so periodic loops can describe their work
+//! without spamming the log. Never blocks the message pump for long
+//! (line-buffered appends).
 
 use std::fs::OpenOptions;
 use std::io::Write;
@@ -14,18 +17,28 @@ pub const LOG_FILE_NAME: &str = "nitro-tray.log";
 /// Global log state; appends serialize on the mutex.
 static STATE: Mutex<LogState> = Mutex::new(LogState {
     enabled: false,
+    debug_enabled: false,
     path: None,
 });
 
 struct LogState {
     enabled: bool,
+    debug_enabled: bool,
     path: Option<PathBuf>,
 }
 
-/// Enable/disable logging (`--log` flag).
+/// Enable/disable logging.
 pub fn set_enabled(enabled: bool) {
     if let Ok(mut state) = STATE.lock() {
         state.enabled = enabled;
+    }
+}
+
+/// Enable/disable DEBUG lines (off by default; loop-internal diagnostics
+/// write at this level).
+pub fn set_debug(debug: bool) {
+    if let Ok(mut state) = STATE.lock() {
+        state.debug_enabled = debug;
     }
 }
 
@@ -36,27 +49,32 @@ pub fn init(exe_dir: &Path) {
     }
 }
 
+/// Append a debug line; written only when debug logging is enabled.
+pub fn debug(message: impl AsRef<str>) {
+    write_line("DEBUG", message.as_ref(), true);
+}
+
 /// Append an info line.
 pub fn info(message: impl AsRef<str>) {
-    write_line("INFO", message.as_ref());
+    write_line("INFO", message.as_ref(), false);
 }
 
 /// Append a warning line.
 pub fn warn(message: impl AsRef<str>) {
-    write_line("WARN", message.as_ref());
+    write_line("WARN", message.as_ref(), false);
 }
 
 /// Append an error line.
 pub fn error(message: impl AsRef<str>) {
-    write_line("ERROR", message.as_ref());
+    write_line("ERROR", message.as_ref(), false);
 }
 
-fn write_line(level: &str, message: &str) {
+fn write_line(level: &str, message: &str, debug: bool) {
     let state = match STATE.lock() {
         Ok(state) => state,
         Err(_) => return, // poisoned mutex: degrade silently
     };
-    if !state.enabled {
+    if !state.enabled || (debug && !state.debug_enabled) {
         return;
     }
     let Some(path) = state.path.as_ref() else {
@@ -127,6 +145,7 @@ mod tests {
         info("first");
         warn("second");
         error("third");
+        debug("fourth");
         assert!(!dir.join(LOG_FILE_NAME).exists(), "no file expected while disabled");
     }
 
@@ -143,5 +162,38 @@ mod tests {
         assert_eq!(lines.len(), 2, "two appends produce exactly two lines");
         assert!(lines[0].starts_with('[') && lines[0].contains("Z] INFO first line"));
         assert!(lines[1].contains("WARN second line"));
+    }
+
+    #[test]
+    fn debug_is_suppressed_until_enabled() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        let dir = temp_dir("debug");
+        init(&dir);
+        set_enabled(true);
+        set_debug(false);
+        debug("hidden line");
+        let log_path = dir.join(LOG_FILE_NAME);
+        assert!(
+            !log_path.exists(),
+            "debug off: no file expected while only debug lines are written"
+        );
+
+        set_debug(true);
+        debug("visible line");
+        assert!(log_path.exists());
+        let contents = std::fs::read_to_string(&log_path).unwrap();
+        assert!(contents.contains("DEBUG visible line"));
+        assert!(!contents.contains("hidden line"));
+    }
+
+    #[test]
+    fn debug_never_writes_when_logging_disabled() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        let dir = temp_dir("debug-disabled");
+        init(&dir);
+        set_enabled(false);
+        set_debug(true);
+        debug("invisible");
+        assert!(!dir.join(LOG_FILE_NAME).exists());
     }
 }

@@ -5,9 +5,10 @@
 //! On-device only: must run elevated (the manifest requires administrator).
 //! `cargo run --bin probe_charge` and observe the printed state transitions.
 
-use nitro_tray::charge::{ChargeError, SmartChargeAdapter};
+use nitro_tray::adapter::AdapterError;
+use nitro_tray::charge::SmartChargeAdapter;
 
-fn report(label: &str, result: Result<bool, ChargeError>) {
+fn report(label: &str, result: Result<bool, AdapterError>) {
     match result {
         Ok(state) => println!("{label}: enabled={state}"),
         Err(e) => println!("{label}: ERROR {e:?}"),

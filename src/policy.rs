@@ -71,12 +71,25 @@ impl Profile {
 
     /// Acer firmware platform profile value (spec: quiet 0, balanced 1,
     /// performance 4, eco 6).
-    pub fn firmware_value(&self) -> u32 {
+    pub const fn firmware_value(&self) -> u32 {
         match self {
             Profile::Quiet => 0,
             Profile::Balanced => 1,
             Profile::Performance => 4,
             Profile::Eco => 6,
+        }
+    }
+
+    /// Reverse of `firmware_value`: the profile for an Acer firmware platform
+    /// profile readback; `None` for unknown values (2, 3, turbo 5, 7, ... —
+    /// turbo is deliberately unmapped: it is not a user profile).
+    pub const fn from_firmware_value(value: u32) -> Option<Profile> {
+        match value {
+            0 => Some(Profile::Quiet),
+            1 => Some(Profile::Balanced),
+            4 => Some(Profile::Performance),
+            6 => Some(Profile::Eco),
+            _ => None,
         }
     }
 
@@ -101,6 +114,16 @@ pub enum HidMode {
 /// Profiles offered per power state, position-bound for the menu.
 pub const AC_PROFILES: [Profile; 3] = [Profile::Quiet, Profile::Balanced, Profile::Performance];
 pub const BATTERY_PROFILES: [Profile; 2] = [Profile::Eco, Profile::Balanced];
+
+/// Profiles offered for a power state, in menu order. The single source of
+/// the AC/battery profile lists — the policy engine and the tray both derive
+/// their menus from this.
+pub fn profiles_for(state: PowerState) -> &'static [Profile] {
+    match state {
+        PowerState::Ac => &AC_PROFILES,
+        PowerState::Battery => &BATTERY_PROFILES,
+    }
+}
 
 /// The exact intended target state for one enforcement action.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -154,10 +177,7 @@ impl PolicyEngine {
 
     /// Profiles offered for the current power state, in menu order.
     pub fn profile_list(&self, state: PowerState) -> &'static [Profile] {
-        match state {
-            PowerState::Ac => &AC_PROFILES,
-            PowerState::Battery => &BATTERY_PROFILES,
-        }
+        profiles_for(state)
     }
 
     /// Forward-wrap cycle through the current power state's list; applies and
@@ -444,5 +464,35 @@ mod tests {
             plan: None,
         };
         assert_eq!(e.reapply_intended(PowerState::Battery, false), want);
+    }
+
+    #[test]
+    fn firmware_value_round_trips_all_profiles() {
+        for profile in [
+            Profile::Quiet,
+            Profile::Balanced,
+            Profile::Performance,
+            Profile::Eco,
+        ] {
+            assert_eq!(
+                Profile::from_firmware_value(profile.firmware_value()),
+                Some(profile)
+            );
+        }
+    }
+
+    #[test]
+    fn from_firmware_value_maps_spec_values() {
+        assert_eq!(Profile::from_firmware_value(0), Some(Profile::Quiet));
+        assert_eq!(Profile::from_firmware_value(1), Some(Profile::Balanced));
+        assert_eq!(Profile::from_firmware_value(4), Some(Profile::Performance));
+        assert_eq!(Profile::from_firmware_value(6), Some(Profile::Eco));
+    }
+
+    #[test]
+    fn from_firmware_value_rejects_unknown_values() {
+        for value in [2, 3, 5, 7, 0xFF, u32::MAX] {
+            assert_eq!(Profile::from_firmware_value(value), None, "value {value}");
+        }
     }
 }

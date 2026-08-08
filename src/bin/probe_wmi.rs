@@ -11,9 +11,9 @@
 use std::thread;
 use std::time::Duration;
 
-use nitro_tray::wmi::{
-    WmiAdapter, PROFILE_BALANCED, PROFILE_ECO, PROFILE_PERFORMANCE, PROFILE_QUIET,
-};
+use nitro_tray::adapter::WMI_NAMESPACE;
+use nitro_tray::policy::Profile;
+use nitro_tray::wmi::{WmiAdapter, CLASS_NAME};
 
 fn main() {
     let adapter = match WmiAdapter::connect() {
@@ -23,7 +23,7 @@ fn main() {
             std::process::exit(1);
         }
     };
-    println!("connected to ROOT\\WMI / AcerGamingFunction");
+    println!("connected to {WMI_NAMESPACE} / {CLASS_NAME}");
 
     let original = match adapter.get_platform_profile() {
         Ok(profile) => profile,
@@ -35,12 +35,13 @@ fn main() {
     println!("current platform profile: {original} (0x{original:X})");
 
     let steps = [
-        (PROFILE_QUIET, "quiet"),
-        (PROFILE_BALANCED, "balanced"),
-        (PROFILE_PERFORMANCE, "performance"),
-        (PROFILE_ECO, "eco"),
+        (Profile::Quiet, "quiet"),
+        (Profile::Balanced, "balanced"),
+        (Profile::Performance, "performance"),
+        (Profile::Eco, "eco"),
     ];
-    for (value, name) in steps {
+    for (profile, name) in steps {
+        let value = profile.firmware_value();
         match adapter.set_platform_profile(value) {
             Ok(()) => println!("set profile {name} ({value}): ok"),
             Err(e) => {

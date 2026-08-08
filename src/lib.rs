@@ -4,11 +4,10 @@
 //! All hardware/OS control is in-process (COM/WMI, power APIs, HID feature
 //! reports). No external process is ever spawned.
 
+pub mod adapter;
 pub mod app;
 pub mod charge;
-pub mod comwbem;
 pub mod config;
-pub mod enforcement;
 pub mod hid;
 pub mod hotkey;
 pub mod log;
@@ -16,8 +15,11 @@ pub mod mi;
 pub mod policy;
 pub mod power;
 pub mod power_state;
-pub mod reapply;
-pub mod recovery;
 pub mod task;
+pub mod timers;
+pub mod transport;
 pub mod tray;
 pub mod wmi;
+
+#[cfg(test)]
+pub mod testing;

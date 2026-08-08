@@ -1,4 +1,4 @@
-# 17 — Linux port: same firmware control, native Linux stack
+# 01 — Linux port: same firmware control, native Linux stack
 
 **What to build:** port nitro-tray to Linux (x64). The machine-controlling knowledge that took tickets 05–16 to build lives on the *firmware* side — ACPI-WMI (AcerGamingFunction, BatteryControl) and the Acer HID feature-report protocol are OS-independent — so the port reuses the policy engine, opcode tables, and adapter seams and replaces the OS-specific layers: the MI transport (`mi.rs`, mi.dll), the power layer (`power.rs`, Windows power APIs), the tray/hotkey backends, and the elevation model (single elevated exe + scheduled task today).
 
@@ -6,7 +6,7 @@
 
 **Prior art / evidence:**
 
-- The ACPI-WMI GUID `{7A4DDFE7-5B5D-40B4-8595-4408E0CC7F56}` is a DSDT device, not a Windows artifact: Linux's WMI framework (`drivers/platform/x86/wmi.c`) enumerates ACPI-WMI devices from `_WDG` and can execute MOF-announced methods from userspace via the WMI chardev ioctl (`WMI_IOCTL_EXEC_METHOD`, `include/uapi/linux/wmi.h`). This is the Linux analog of the instance-bound MI invoke (ticket 16): same GUID, same method names (`SetGamingMiscSetting`…), same gmInput semantics.
+- The ACPI-WMI GUID `{7A4DDFE7-5B5D-40B4-8595-4408E0CC7F56}` is a DSDT device, not a Windows artifact: Linux's WMI framework (`drivers/platform/x86/wmi.c`) enumerates ACPI-WMI devices from `_WDG` and can execute MOF-announced methods from userspace via the WMI chardev ioctl (`WMI_IOCTL_EXEC_METHOD`, `include/uapi/linux/wmi.h`). This is the Linux analog of the instance-bound MI invoke (ticket 16, nitro-tray feature): same GUID, same method names (`SetGamingMiscSetting`…), same gmInput semantics.
 - Existing Linux projects already drive these Acer gaming SKUs (e.g. the `acer-predator-turbo-and-rgb` kernel driver family), which proves the ACPI path works on Linux — and shows the fallback if the chardev route is insufficient: a tiny out-of-tree kernel driver.
 - The HID device (0x1025:0x174B, 65-byte feature reports) is reachable via `/dev/hidraw` (`HIDIOCSFEATURE`/`HIDIOCGFEATURE`) — same reports, same `usage_mode_report` encoding.
 - The smart-charge write semantics discovered in ticket 16 are transport-independent: a truthy return is not proof of effect; the single-pair readback match (`uFunctionList & 2`, `uFunctionStatus[1]`) gates success. The Linux port must keep readback-verified writes.
@@ -40,3 +40,5 @@
 ## Comments
 
 2026-08-08: Filed from the feasibility discussion. The port reuses everything OS-independent (policy engine, config, state machine, opcode tables, readback-verified write logic) and rebuilds five OS-specific seams: WMI transport, HID transport, power layer, tray/hotkey, lifecycle/elevation. The MI-transport lessons (instance-bound invocation, readback-verified writes, breaker + recovery loop) carry over as adapter-level requirements, not Windows-specific knowledge.
+
+2026-08-08: Moved from the nitro-tray feature (was ticket 17) to this feature dir on the tracker; renumbered to 01. References to tickets 05–16 and 16 above point into the nitro-tray feature (`/scratch/nitro-tray/issues/`), where the machine-specific evidence and decisions live.
