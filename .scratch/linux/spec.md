@@ -14,21 +14,22 @@ and replaces the OS-specific seams.
 
 ## Rebuilt per seam
 
-- WMI transport → Linux WMI chardev ioctl (`WMI_IOCTL_EXEC_METHOD`) or a minimal
-  kernel driver.
+- WMI transport → own GPL-2.0 DKMS kernel module (misc chardev); mainline Linux
+  has no generic userspace WMI.
 - HID transport → `/dev/hidraw` (same 65-byte feature reports).
 - Power layer → sysfs / `cpupower` / power-profiles-daemon (no external
   processes, per design decision 7).
 - Power state → `/sys/class/power_supply/`.
-- Tray + hotkey → GTK/iced (+ ksni-style tray), global-hotkey registration.
-- Lifecycle/elevation → systemd/XDG autostart; root service + user client over
-  D-Bus vs. single root process (the elevation decision).
+- Tray + hotkey → pure-Rust: ksni (StatusNotifier), notify-rust, global-hotkey (X11; Wayland degrades).
+- Lifecycle/elevation → XDG autostart; single unprivileged process with
+  one-time root setup (udev rules) — no root service.
 
 ## Design questions
 
-Transport (chardev vs. kernel driver), elevation model, GUI toolkit, power
-backend, and scope (AN16S-61 only vs. general Acer Nitro) — recorded in
-`issues/01-linux-port.md`.
+Resolved 2026-08-08 — answers recorded in the Answer section of
+`issues/01-linux-port.md`. The chardev-ioctl premise was disproven during
+triage: mainline Linux has no generic userspace WMI API, so the WMI transport
+is a kernel module.
 
 ## Out of scope
 
@@ -36,6 +37,12 @@ No installer, no auto-update, no interpreter spawning, fan is auto-only.
 
 ## Issues
 
-- `issues/01-linux-port.md` — the design/effort ticket (filed 2026-08-08,
-  originally 17 in the nitro-tray feature; moved here 2026-08-08). To be split
-  into implementation tickets once its design questions are resolved.
+- `issues/01-linux-port.md` — the design/effort ticket; resolved 2026-08-08,
+  answers in its Answer section.
+- `issues/02-platform-gate.md` — platform-gate + Linux stubs (Windows-first).
+- `issues/03-wmi-kernel-module.md` — GPL-2.0 kernel module + Linux WMI transport.
+- `issues/04-hid-hidraw.md` — HID transport on `/dev/hidraw`.
+- `issues/05-power-sysfs.md` — power layer on sysfs.
+- `issues/06-power-state-sysfs.md` — power state on `/sys/class/power_supply`.
+- `issues/07-tray-hotkey-lifecycle.md` — tray/hotkey/lifecycle/paths.
+- `issues/08-end-to-end-verification.md` — final on-device acceptance (ready-for-human).

@@ -5,18 +5,30 @@
 //! Encodings match the proven AeroForge tables (see `docs/firmware-notes.md`):
 //! 65-byte feature reports with a 9-byte prefix `A0 00 A0 01 00 01 <mode> 00 00`
 //! on the device whose path contains `hid#1025174b&col01#` (VID 0x1025).
+//!
+//! Platform split (linux-port ticket 02): the encoding helpers, the
+//! `HidTransport` seam, and the `HidAdapter` retry logic are OS-independent.
+//! Windows: discovery + `RealHidTransport` over SetupDi/`HidD_SetFeature`/
+//! `HidD_GetFeature`. Linux: `RealHidTransport` is a stub whose seam reports
+//! "unavailable" — the real `/dev/hidraw` transport (same 65-byte reports,
+//! `HIDIOCSFEATURE`/`HIDIOCGFEATURE`) lands in ticket 04.
 
+#[cfg(windows)]
 use std::mem::size_of;
 
+#[cfg(windows)]
 use windows_sys::core::GUID;
+#[cfg(windows)]
 use windows_sys::Win32::Devices::DeviceAndDriverInstallation::{
     SetupDiDestroyDeviceInfoList, SetupDiEnumDeviceInterfaces, SetupDiGetClassDevsW,
     SetupDiGetDeviceInterfaceDetailW, SP_DEVICE_INTERFACE_DATA, SP_DEVICE_INTERFACE_DETAIL_DATA_W,
     DIGCF_DEVICEINTERFACE, DIGCF_PRESENT, HDEVINFO,
 };
+#[cfg(windows)]
 use windows_sys::Win32::Devices::HumanInterfaceDevice::{
     HidD_GetAttributes, HidD_GetFeature, HidD_GetHidGuid, HidD_SetFeature, HIDD_ATTRIBUTES,
 };
+#[cfg(windows)]
 use windows_sys::Win32::Foundation::{
     CloseHandle, GetLastError, GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE,
 };
@@ -36,16 +48,21 @@ const WRITE_ATTEMPTS: u32 = 4;
 const WRITE_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(750);
 
 /// Device-path marker for the usage-mode collection (lowercase).
+#[cfg(windows)]
 const DEVICE_PATH_MARKER: &str = "hid#1025174b&col01#";
 
 // windows-sys 0.61 puts `CreateFileW` in `Win32::Storage::FileSystem`
 // (feature `Win32_Storage_FileSystem`, not enabled in Cargo.toml — the
 // manifest is frozen). Declared here instead; kernel32.lib is linked by
 // default on MSVC. The share/disposition constants are stable Win32 values.
+#[cfg(windows)]
 const FILE_SHARE_READ: u32 = 0x1;
+#[cfg(windows)]
 const FILE_SHARE_WRITE: u32 = 0x2;
+#[cfg(windows)]
 const OPEN_EXISTING: u32 = 0x3;
 
+#[cfg(windows)]
 unsafe extern "system" {
     fn CreateFileW(
         lp_file_name: windows_sys::core::PCWSTR,
@@ -95,14 +112,34 @@ pub enum HidError {
 /// stays in `open()`; the seam is the transport: `RealHidTransport` wraps
 /// the opened handle in production, a scripted fake satisfies it in tests
 /// (`HidAdapter<T>` is generic over the transport).
+#[cfg(windows)]
 pub struct RealHidTransport {
     handle: HANDLE,
     path: String,
 }
 
+#[cfg(windows)]
 impl Drop for RealHidTransport {
     fn drop(&mut self) {
         unsafe { CloseHandle(self.handle) };
+    }
+}
+
+/// Linux stub transport (linux-port ticket 02): reports "unavailable" until
+/// the `/dev/hidraw` transport lands (ticket 04). Keeps the same name so
+/// `AppCore`'s default generic argument stays platform-agnostic; ticket 04
+/// replaces this body only.
+#[cfg(target_os = "linux")]
+pub struct RealHidTransport;
+
+#[cfg(target_os = "linux")]
+impl HidTransport for RealHidTransport {
+    fn set_feature(&self, _report: &[u8; 65]) -> Result<(), HidError> {
+        Err(HidError::NotFound)
+    }
+
+    fn get_feature(&self, _buffer: &mut [u8; 65]) -> Result<(), HidError> {
+        Err(HidError::NotFound)
     }
 }
 
@@ -116,6 +153,7 @@ pub trait HidTransport {
     fn get_feature(&self, buffer: &mut [u8; 65]) -> Result<(), HidError>;
 }
 
+#[cfg(windows)]
 impl HidTransport for RealHidTransport {
     fn set_feature(&self, report: &[u8; 65]) -> Result<(), HidError> {
         let ok = unsafe { HidD_SetFeature(self.handle, report.as_ptr().cast(), REPORT_LEN) };
@@ -221,6 +259,7 @@ impl<T: HidTransport> HidAdapter<T> {
     }
 }
 
+#[cfg(windows)]
 impl HidAdapter<RealHidTransport> {
     /// Enumerate HID device interfaces (`SetupDiGetClassDevsW` with
     /// `HidD_GetHidGuid`, DIGCF_PRESENT | DIGCF_DEVICEINTERFACE), match the
@@ -286,9 +325,21 @@ impl HidAdapter<RealHidTransport> {
     }
 }
 
+/// Linux stub (linux-port ticket 02): no HID device open on Linux yet — the
+/// `/dev/hidraw` discovery (VID 0x1025 across hidraw nodes) lands in ticket
+/// 04. `NotFound` makes the entry point log "usage-mode adapter unavailable"
+/// exactly like the Windows no-device path.
+#[cfg(target_os = "linux")]
+impl HidAdapter<RealHidTransport> {
+    pub fn open() -> Result<Self, HidError> {
+        Err(HidError::NotFound)
+    }
+}
+
 /// Fetch the device-interface path for one interface. Two-call pattern:
 /// first with a null buffer to learn the required size, then into a buffer
 /// whose `cbSize` is set to the struct size.
+#[cfg(windows)]
 unsafe fn device_interface_path(
     info_set: HDEVINFO,
     if_data: *const SP_DEVICE_INTERFACE_DATA,
@@ -328,6 +379,7 @@ unsafe fn device_interface_path(
 }
 
 /// Open a device path with the documented share modes. `None` on failure.
+#[cfg(windows)]
 unsafe fn open_device(path: &str) -> Option<HANDLE> {
     let mut wide: Vec<u16> = path.encode_utf16().collect();
     wide.push(0);

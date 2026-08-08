@@ -15,8 +15,11 @@
 //! `new_instance`/`MiInstance`) stays public — the probes use it directly.
 
 use crate::mi::{
-    MiConnection, MiError, MiInstance, MI_RESULT_TYPE_MISMATCH,
+    MiError, MI_RESULT_TYPE_MISMATCH,
 };
+
+#[cfg(windows)]
+use crate::mi::{MiConnection, MiInstance};
 
 /// One input element of a method call: a parameter name plus its explicitly
 /// typed value (the type is part of the value — no method-name inference).
@@ -189,6 +192,7 @@ pub trait MiTransport {
 /// each method's MOF declares. The real out instance carries more elements
 /// (e.g. the readback's `uBatteryNo`/`uFunctionQuery` echoes); only the
 /// consumed ones cross the seam — absent elements are skipped.
+#[cfg(windows)]
 const OUT_PROBES: &[(&str, OutProbe)] = &[
     ("gmOutput", OutProbe::U64),
     ("ReturnValue", OutProbe::U32),
@@ -197,12 +201,14 @@ const OUT_PROBES: &[(&str, OutProbe)] = &[
     ("uFunctionStatus", OutProbe::U8Array),
 ];
 
+#[cfg(windows)]
 enum OutProbe {
     U64,
     U32,
     U8Array,
 }
 
+#[cfg(windows)]
 impl MiTransport for MiConnection {
     /// The production transport: initiate a fresh MI session, then invoke
     /// `method` on the first instance of `class` (the `-InputObject` binding
@@ -242,6 +248,7 @@ impl MiTransport for MiConnection {
 /// Materialize the probed out params of an out-params instance into owned
 /// elements; an absent element is skipped (`MI_Instance_GetElement` answers
 /// `NO_SUCH_PROPERTY`), a present one with an unexpected type is an error.
+#[cfg(windows)]
 fn out_elements(result: &MiInstance) -> Result<Vec<MiElement>, MiError> {
     let mut elements = Vec::new();
     for (name, probe) in OUT_PROBES {

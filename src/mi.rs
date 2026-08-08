@@ -1,30 +1,42 @@
-//! In-process MI (Management Infrastructure) client — hand-rolled FFI to
-//! `mi.dll` (`C:\Windows\System32\mi.dll`), the stack PowerShell's CIM
-//! cmdlets use. Replaces the WBEM-COM route (`comwbem`) for the Acer WMI
-//! adapters: on the AN16S-61 the WbemCore -> wmiprvse handoff flaps in bad
-//! windows, while the MI transport succeeds 100% of the time (ticket 16).
+//! Management Infrastructure (MI) — the Acer firmware transport, split by
+//! platform (linux-port ticket 02).
 //!
-//! Layouts and signatures are transcribed from the Windows SDK 10.0.26100
-//! `um\mi.h` (8-byte packed): `MI_Result`, `MI_Type`, `MI_Value`, the
-//! `MI_Application`/`MI_Session`/`MI_Operation`/`MI_Instance` handles and
-//! their function tables. Only `MI_Application_Initialize` is imported from
-//! the DLL; everything else goes through the function tables, exactly like
-//! the C API's inline wrappers do.
+//! Shared, OS-independent surface: the MI result/type codes, `MiError`, and
+//! the result/type name tables (used by the `MiTransport` seam, the shared
+//! circuit breaker in `adapter.rs`, and the scripted fakes in `testing.rs`).
 //!
+//! Windows: the in-process MI client — hand-rolled FFI to `mi.dll`
+//! (`C:\Windows\System32\mi.dll`), the stack PowerShell's CIM cmdlets use.
+//! Replaces the WBEM-COM route (`comwbem`) for the Acer WMI adapters: on the
+//! AN16S-61 the WbemCore -> wmiprvse handoff flaps in bad windows, while the
+//! MI transport succeeds 100% of the time (ticket 16). Layouts and signatures
+//! are transcribed from the Windows SDK 10.0.26100 `um\mi.h` (8-byte packed):
+//! `MI_Result`, `MI_Type`, `MI_Value`, the `MI_Application`/`MI_Session`/
+//! `MI_Operation`/`MI_Instance` handles and their function tables. Only
+//! `MI_Application_Initialize` is imported from the DLL; everything else goes
+//! through the function tables, exactly like the C API's inline wrappers do.
 //! All operations are synchronous (no callbacks): session operations are
 //! started with a NULL `MI_OperationCallbacks` and results are pulled with
-//! `MI_Operation_GetInstance`, which blocks until a result is available
-//! (the documented synchronous mode). Instances returned by the pulls
-//! belong to the operation and are invalidated by the next pull — they are
-//! cloned (`MI_Instance_Clone`) before the loop advances.
+//! `MI_Operation_GetInstance`, which blocks until a result is available (the
+//! documented synchronous mode). Instances returned by the pulls belong to
+//! the operation and are invalidated by the next pull — they are cloned
+//! (`MI_Instance_Clone`) before the loop advances. Every `pub unsafe fn`
+//! carries a `# Safety` contract (house style, see `comwbem.rs`). Public
+//! entry points are safe wrappers returning raw `MI_Result` codes as
+//! `MiError`; adapters map those to their own error types.
 //!
-//! Every `pub unsafe fn` carries a `# Safety` contract (house style, see
-//! `comwbem.rs`). Public entry points are safe wrappers returning raw
-//! `MI_Result` codes as `MiError`; adapters map those to their own error
-//! types.
+//! Linux: `MiConnection` is a stub whose `MiTransport` implementation reports
+//! "unavailable" — mainline Linux has no generic userspace WMI API (ticket
+//! 02); the real Linux transport over the ticket-03 kernel-module chardev
+//! lands later and only needs to implement the same `MiTransport` seam.
 
+#[cfg(windows)]
 use std::ffi::c_void;
+#[cfg(windows)]
 use std::ptr::{null, null_mut};
+
+#[cfg(target_os = "linux")]
+use crate::transport::{MiInput, MiOutput, MiTransport};
 
 /// MI_Char is `wchar_t` (`MI_CHAR_TYPE` defaults to 2 in mi.h).
 pub type MiChar = u16;
@@ -157,6 +169,7 @@ pub const MI_FLAG_BORROW: u32 = 1 << 30;
 /// `MI_Timestamp` (mi.h): YYYYMMDDHHMMSS.MMMMMMSUTC, 8 x u32.
 #[repr(C)]
 #[derive(Clone, Copy)]
+#[cfg(windows)]
 pub struct MiTimestamp {
     pub year: u32,
     pub month: u32,
@@ -171,6 +184,7 @@ pub struct MiTimestamp {
 /// `MI_Interval` (mi.h): DDDDDDDDHHMMSS.MMMMMM:000, 8 x u32.
 #[repr(C)]
 #[derive(Clone, Copy)]
+#[cfg(windows)]
 pub struct MiInterval {
     pub days: u32,
     pub hours: u32,
@@ -183,6 +197,7 @@ pub struct MiInterval {
 /// `MI_Datetime` (mi.h): `{ u32 isTimestamp; union { timestamp; interval } }`.
 #[repr(C)]
 #[derive(Clone, Copy)]
+#[cfg(windows)]
 pub struct MiDatetime {
     pub is_timestamp: u32,
     pub u: MiDatetimeU,
@@ -190,6 +205,7 @@ pub struct MiDatetime {
 
 #[repr(C)]
 #[derive(Clone, Copy)]
+#[cfg(windows)]
 pub union MiDatetimeU {
     pub timestamp: MiTimestamp,
     pub interval: MiInterval,
@@ -199,6 +215,7 @@ pub union MiDatetimeU {
 /// union's array members share this shape).
 #[repr(C)]
 #[derive(Clone, Copy)]
+#[cfg(windows)]
 pub struct MiArray {
     pub data: *mut c_void,
     pub size: u32,
@@ -209,6 +226,7 @@ pub struct MiArray {
 /// never blindly.
 #[repr(C)]
 #[derive(Clone, Copy)]
+#[cfg(windows)]
 pub union MiValue {
     pub boolean: MiBoolean,
     pub uint8: u8,
@@ -247,11 +265,13 @@ pub union MiValue {
 
 /// Placeholder slot for FT methods this crate never calls (kept typed so the
 /// table layout stays exact; comwbem.rs uses the same pattern).
+#[cfg(windows)]
 type Slot = unsafe extern "system" fn() -> MiResult;
 
 /// `struct _MI_Application` (mi.h): `{ u64 reserved1; ptrdiff_t reserved2;
 /// const MI_ApplicationFT* ft; }` (MI_APPLICATION_NULL initializer).
 #[repr(C)]
+#[cfg(windows)]
 pub struct MiApplicationRaw {
     pub reserved1: u64,
     pub reserved2: isize,
@@ -260,6 +280,7 @@ pub struct MiApplicationRaw {
 
 /// `struct _MI_Session` (mi.h), same handle shape.
 #[repr(C)]
+#[cfg(windows)]
 pub struct MiSessionRaw {
     pub reserved1: u64,
     pub reserved2: isize,
@@ -268,6 +289,7 @@ pub struct MiSessionRaw {
 
 /// `struct _MI_Operation` (mi.h), same handle shape.
 #[repr(C)]
+#[cfg(windows)]
 pub struct MiOperationRaw {
     pub reserved1: u64,
     pub reserved2: isize,
@@ -277,6 +299,7 @@ pub struct MiOperationRaw {
 /// `struct _MI_Instance` (mi.h): `{ ft; classDecl; serverName; nameSpace;
 /// reserved[4] }`. Only the FT pointer is dereferenced.
 #[repr(C)]
+#[cfg(windows)]
 pub struct MiInstanceRaw {
     pub ft: *const MiInstanceFt,
     pub class_decl: *const c_void,
@@ -287,6 +310,7 @@ pub struct MiInstanceRaw {
 
 /// `MI_ApplicationFT` (mi.h) — slot order from the header, verbatim.
 #[repr(C)]
+#[cfg(windows)]
 pub struct MiApplicationFt {
     pub close: unsafe extern "system" fn(application: *mut MiApplicationRaw) -> MiResult,
     pub new_session: unsafe extern "system" fn(
@@ -316,6 +340,7 @@ pub struct MiApplicationFt {
 
 /// `MI_SessionFT` (mi.h) — slot order from the header, verbatim.
 #[repr(C)]
+#[cfg(windows)]
 pub struct MiSessionFt {
     pub close: unsafe extern "system" fn(
         session: *mut MiSessionRaw,
@@ -360,6 +385,7 @@ pub struct MiSessionFt {
 
 /// `MI_OperationFT` (mi.h) — slot order from the header, verbatim.
 #[repr(C)]
+#[cfg(windows)]
 pub struct MiOperationFt {
     pub close: unsafe extern "system" fn(operation: *mut MiOperationRaw) -> MiResult,
     pub cancel: Slot,
@@ -378,6 +404,7 @@ pub struct MiOperationFt {
 
 /// `MI_InstanceFT` (mi.h) — slot order from the header, verbatim.
 #[repr(C)]
+#[cfg(windows)]
 pub struct MiInstanceFt {
     pub clone: unsafe extern "system" fn(
         self_: *const MiInstanceRaw,
@@ -433,6 +460,7 @@ pub struct MiInstanceFt {
 // `link /dump /exports` on 10.0.26100 — the plain `MI_Application_Initialize`
 // spelling from mi.h is a macro mapping to the V1 export).
 // `MI_MAIN_CALL` is `__cdecl` in mi.h — `extern "C"` on Windows.
+#[cfg(windows)]
 #[link(name = "mi")]
 unsafe extern "C" {
     fn MI_Application_InitializeV1(
@@ -466,11 +494,13 @@ impl std::fmt::Display for MiError {
 /// closed on drop. The session field is declared FIRST so it is dropped
 /// before the application closes (all sessions must be closed before
 /// `MI_Application_Close` completes).
+#[cfg(windows)]
 pub struct MiConnection {
     session: MiSessionRaw,
     application: MiApplicationRaw,
 }
 
+#[cfg(windows)]
 impl MiConnection {
     /// Initialize the MI client and open a session to the local machine
     /// (`MI_Application_InitializeV1(0, "NitroTray", ...)` +
@@ -621,6 +651,7 @@ impl MiConnection {
     }
 }
 
+#[cfg(windows)]
 impl Drop for MiConnection {
     fn drop(&mut self) {
         if !self.session.ft.is_null() {
@@ -634,13 +665,53 @@ impl Drop for MiConnection {
     }
 }
 
+/// Linux stub transport (linux-port ticket 02): mainline Linux has no generic
+/// userspace WMI API, so the Acer firmware seam reports "unavailable" until
+/// the ticket-03 kernel-module chardev transport lands. Keeps the same name
+/// so `AppCore`'s default generic argument and the binary entry point stay
+/// platform-agnostic; the real Linux transport replaces this body, nothing
+/// else.
+#[cfg(target_os = "linux")]
+pub struct MiConnection;
+
+/// The Linux stub's failure: `NOT_FOUND` (nothing to find yet) with the
+/// ticket-02/03 pointer — one shared literal so `connect()` and
+/// `invoke_first_instance` cannot drift apart.
+#[cfg(target_os = "linux")]
+fn linux_unavailable(op: &'static str) -> MiError {
+    MiError {
+        result: MI_RESULT_NOT_FOUND,
+        op,
+        message: Some("no WMI transport on Linux yet (ticket 02; chardev in ticket 03)".into()),
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl MiTransport for MiConnection {
+    fn connect() -> Result<Self, MiError> {
+        Err(linux_unavailable("linux-mi"))
+    }
+
+    fn invoke_first_instance(
+        &self,
+        _namespace: &str,
+        _class: &str,
+        _method: &str,
+        _input: &MiInput,
+    ) -> Result<Option<MiOutput>, MiError> {
+        Err(linux_unavailable("linux-mi"))
+    }
+}
+
 /// RAII `MI_Instance`: `MI_Instance_Delete` on drop. Instances from the
 /// operation loops are cloned (`MI_Instance_Clone`) so their lifetime no
 /// longer depends on the operation.
+#[cfg(windows)]
 pub struct MiInstance {
     raw: *mut MiInstanceRaw,
 }
 
+#[cfg(windows)]
 impl MiInstance {
     /// Wraps a heap-allocated `MI_Instance`; the wrapper deletes it on drop.
     ///
@@ -763,6 +834,7 @@ impl MiInstance {
     }
 }
 
+#[cfg(windows)]
 impl Drop for MiInstance {
     fn drop(&mut self) {
         if !self.raw.is_null() {
@@ -778,10 +850,12 @@ impl Drop for MiInstance {
 /// RAII `MI_Operation`: `MI_Operation_Close` on drop (synchronous — blocks
 /// until the operation is done; a never-started operation has a null FT and
 /// is a no-op).
+#[cfg(windows)]
 pub struct MiOperation {
     raw: MiOperationRaw,
 }
 
+#[cfg(windows)]
 impl MiOperation {
     fn from_raw(raw: MiOperationRaw) -> Self {
         Self { raw }
@@ -824,6 +898,7 @@ impl MiOperation {
     }
 }
 
+#[cfg(windows)]
 impl Drop for MiOperation {
     fn drop(&mut self) {
         if !self.raw.ft.is_null() {
@@ -834,6 +909,7 @@ impl Drop for MiOperation {
 }
 
 /// `MI_Instance_Clone` — the cloned instance is owned by the caller.
+#[cfg(windows)]
 fn instance_clone(instance: *const MiInstanceRaw) -> Result<MiInstance, MiError> {
     let ft = unsafe { (*instance).ft };
     let mut clone: *mut MiInstanceRaw = null_mut();
@@ -850,6 +926,7 @@ fn instance_clone(instance: *const MiInstanceRaw) -> Result<MiInstance, MiError>
 /// # Safety
 /// `array` must have been produced by the MI library and be valid until the
 /// copy completes.
+#[cfg(windows)]
 unsafe fn array_to_vec(array: MiArray) -> Vec<u8> {
     unsafe {
         if array.data.is_null() || array.size == 0 {
@@ -860,6 +937,7 @@ unsafe fn array_to_vec(array: MiArray) -> Vec<u8> {
 }
 
 /// Coerce a scalar `MI_Value` of the given type to `u64` (pure, unit-tested).
+#[cfg(windows)]
 pub fn coerce_u64(value: &MiValue, ty: MiType) -> Option<u64> {
     unsafe {
         match ty {
@@ -881,6 +959,7 @@ pub fn coerce_u64(value: &MiValue, ty: MiType) -> Option<u64> {
 ///
 /// # Safety
 /// `ptr` must be a valid NUL-terminated wide string for the call duration.
+#[cfg(windows)]
 unsafe fn wide_from_ptr(ptr: *const MiChar) -> String {
     unsafe {
         let mut len = 0usize;
@@ -892,6 +971,7 @@ unsafe fn wide_from_ptr(ptr: *const MiChar) -> String {
 }
 
 /// Wide NUL-terminated buffer for API calls (mirrors `comwbem::wide`).
+#[cfg(windows)]
 pub fn wide(text: &str) -> Vec<MiChar> {
     text.encode_utf16().chain(core::iter::once(0)).collect()
 }
@@ -912,6 +992,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)]
     fn coerce_u64_reads_every_scalar_shape() {
         assert_eq!(coerce_u64(&MiValue { uint8: 0x73 }, MI_UINT8), Some(0x73));
         assert_eq!(coerce_u64(&MiValue { uint16: 0x0041 }, MI_UINT16), Some(0x41));
@@ -924,6 +1005,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)]
     fn value_union_is_the_c_union_size() {
         assert_eq!(std::mem::size_of::<MiValue>(), 40); // largest member: MI_Datetime
         assert_eq!(std::mem::align_of::<MiValue>(), 8);
@@ -945,6 +1027,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)]
     fn wide_buffers_are_nul_terminated() {
         assert_eq!(wide("ROOT\\WMI"), vec![
             b'R' as u16, b'O' as u16, b'O' as u16, b'T' as u16, b'\\' as u16, b'W' as u16, b'M' as u16,

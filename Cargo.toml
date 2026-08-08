@@ -15,6 +15,11 @@ path = "src/main.rs"
 
 [dependencies]
 toml = "0.8"
+
+# Windows-only dependencies: the three firmware/power transports (mi.dll WMI,
+# HID, power APIs) and the tray/hotkey/task modules are target-gated, so the
+# Linux build compiles none of them (ticket 02, linux port).
+[target.'cfg(windows)'.dependencies]
 # Task Scheduler 2.0 COM bindings are not part of windows-sys (taskschd was
 # removed from the shared metadata); winapi 0.3 ships correct, stable
 # bindings and GUIDs for taskschd. It is used ONLY by src/task.rs.
@@ -39,7 +44,7 @@ windows-sys = { version = "0.61", features = [
     "Win32_Graphics_Gdi",
 ] }
 
-[build-dependencies]
+[target.'cfg(windows)'.build-dependencies]
 embed-manifest = "1"
 
 [profile.release]

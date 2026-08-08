@@ -11,7 +11,7 @@
 - The HID device (0x1025:0x174B, 65-byte feature reports) is reachable via `/dev/hidraw` (`HIDIOCSFEATURE`/`HIDIOCGFEATURE`) — same reports, same `usage_mode_report` encoding.
 - The smart-charge write semantics discovered in ticket 16 are transport-independent: a truthy return is not proof of effect; the single-pair readback match (`uFunctionList & 2`, `uFunctionStatus[1]`) gates success. The Linux port must keep readback-verified writes.
 
-**Status:** needs-triage
+**Status:** resolved
 
 **Blocked by:** None (design/effort ticket; no code dependency on an open ticket)
 
@@ -42,3 +42,17 @@
 2026-08-08: Filed from the feasibility discussion. The port reuses everything OS-independent (policy engine, config, state machine, opcode tables, readback-verified write logic) and rebuilds five OS-specific seams: WMI transport, HID transport, power layer, tray/hotkey, lifecycle/elevation. The MI-transport lessons (instance-bound invocation, readback-verified writes, breaker + recovery loop) carry over as adapter-level requirements, not Windows-specific knowledge.
 
 2026-08-08: Moved from the nitro-tray feature (was ticket 17) to this feature dir on the tracker; renumbered to 01. Machine-specific firmware evidence and decisions live in `docs/firmware-notes.md` (the nitro-tray feature tickets were deleted when the notes were distilled).
+
+## Answer (2026-08-08)
+
+**This Answer supersedes the design-question and checklist premises above.** Implementation tickets: 02–08.
+
+- **Transport:** own minimal GPL-2.0 DKMS kernel module + misc chardev. The chardev-ioctl premise is **disproven** — mainline Linux has no generic userspace WMI (`WMI_IOCTL_EXEC_METHOD` does not exist); ACPI-WMI methods execute in-kernel only. BatteryControl GUID to be discovered from the Linuwu-Sense source and `/sys/bus/wmi/devices`. → ticket 03
+- **Elevation:** single unprivileged process + one-time root setup (module install, udev rules: chardev group access, hidraw VID rule, cpufreq attr chmod). No root service, no D-Bus split, no IPC.
+- **HID:** `/dev/hidraw`, same 65-byte reports, VID 0x1025 discovery. On the AN16S-61 the device is I2C-HID; RGB is a separate ENE K5130 (out of scope). Usage-mode kept best-effort, probe-first, degrade on silent-ignore. → ticket 04
+- **Power backend:** direct in-process sysfs (governor/EPP/boost per profile, plan table 1:1); no external processes (decision 7); ppd conflict detect-and-warn; EACCES degrades. → ticket 05
+- **Power state:** `/sys/class/power_supply` AC0 online + capacity. → ticket 06
+- **Tray/UI:** pure Rust — ksni (StatusNotifier), notify-rust, global-hotkey (X11; Wayland degrades); no GUI toolkit, no C build deps. → ticket 07
+- **Lifecycle:** XDG autostart `.desktop` toggled from the tray; flock single-instance; XDG config/state/log paths.
+- **Scope:** AN16S-61 only, tables as data.
+- **Sequencing:** ticket 02 first, implemented and verified on Windows before the reboot; then 03–05 in any order on Linux (probe-first), 06, 07, 08 last (ready-for-human).

@@ -181,6 +181,7 @@ impl<M: MiTransport> WmiAdapter<M> {
     }
 }
 
+#[cfg(windows)]
 impl WmiAdapter<MiConnection> {
     /// Connect to `ROOT\WMI` via in-process MI (`mi.dll`): initializes the MI
     /// client and a local session. Session creation does not talk to the
@@ -189,6 +190,17 @@ impl WmiAdapter<MiConnection> {
     pub fn connect() -> Result<Self, AdapterError> {
         let transport = MiConnection::connect().map_err(map_mi)?;
         Ok(Self::with_transport(transport))
+    }
+}
+
+/// Linux stub (linux-port ticket 02): `MiConnection` reports unavailable, so
+/// `connect()` degrades to `NotAvailable` — the entry point logs "running
+/// degraded" exactly like the Windows fallback path. The ticket-03 chardev
+/// transport replaces the `MiConnection::connect()` body only.
+#[cfg(target_os = "linux")]
+impl WmiAdapter<MiConnection> {
+    pub fn connect() -> Result<Self, AdapterError> {
+        Err(AdapterError::NotAvailable)
     }
 }
 
