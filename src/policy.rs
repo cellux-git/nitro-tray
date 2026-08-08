@@ -103,7 +103,8 @@ impl Profile {
     }
 }
 
-/// Acer HID system-usage mode (prior art values: Performance=1, Normal=2, Quiet=3).
+/// Acer HID system-usage mode (Performance=1, Normal=2, Quiet=3; see
+/// `docs/firmware-notes.md`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum HidMode {
     Quiet,

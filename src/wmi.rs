@@ -1,7 +1,7 @@
 //! In-process MI control of the Acer gaming firmware
 //! (`AcerGamingFunction` in `ROOT\WMI`, instance `ACPI\PNP0C14\APGe_0`).
 //! Opcode/method encodings match the proven AeroForge tables (see
-//! `.scratch/nitro-tray/prior-art-aeroforge.md`). No PowerShell/CIM fallback
+//! `docs/firmware-notes.md`). No PowerShell/CIM fallback
 //! exists — everything is raw in-process MI (`mi.dll`) via the shared `mi`
 //! module, bound to the provider-enumerated instance (the `-InputObject`
 //! shape; class-level invocation is rejected by this provider, ticket 16).
@@ -23,18 +23,18 @@ pub const FAN_AUTO: u32 = 0x0041_0009;
 
 /// 16-byte `SetGamingKBBacklight` config that turns the keyboard backlight
 /// off: mode 0 (static), brightness 0, byte 9 (apply flag) 1, rest zero
-/// (see `.scratch/nitro-tray/keyboard-leds.md`).
+/// (see `docs/firmware-notes.md`).
 pub const KEYBOARD_BACKLIGHT_OFF: [u8; 16] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0];
 
 /// Encodes a `SetGamingMiscSetting` request as `(setting, value)` — pure
-/// encoding helper, unit-tested against the prior-art table.
+/// encoding helper, unit-tested against the documented encoding.
 pub fn misc_setting_request(setting: u32, value: u32) -> (u32, u32) {
     (setting, setting | (value << 8))
 }
 
 /// Encodes a `SetGamingFanBehavior` request value — pure encoding helper,
 /// unit-tested (e.g. auto = 0x00410009). Non-auto maps to the max-cooling
-/// behavior input (prior-art §1.5).
+/// behavior input (unused encoding, see `docs/firmware-notes.md`).
 pub fn fan_behavior_request(auto: bool) -> u32 {
     if auto {
         FAN_AUTO
@@ -45,7 +45,7 @@ pub fn fan_behavior_request(auto: bool) -> u32 {
 
 /// Decodes a `GetGamingMiscSetting` gmOutput value: the second byte wins when
 /// it is nonzero or the value exceeds one byte, else the low byte (AMD-shifted
-/// decode, prior-art §1.6).
+/// decode, see `docs/firmware-notes.md`).
 pub fn decode_gm_output_byte(value: u64) -> u8 {
     let shifted = ((value >> 8) & 0xFF) as u8;
     if shifted != 0 || value > 0xFF {

@@ -41,4 +41,4 @@
 
 2026-08-08: Filed from the feasibility discussion. The port reuses everything OS-independent (policy engine, config, state machine, opcode tables, readback-verified write logic) and rebuilds five OS-specific seams: WMI transport, HID transport, power layer, tray/hotkey, lifecycle/elevation. The MI-transport lessons (instance-bound invocation, readback-verified writes, breaker + recovery loop) carry over as adapter-level requirements, not Windows-specific knowledge.
 
-2026-08-08: Moved from the nitro-tray feature (was ticket 17) to this feature dir on the tracker; renumbered to 01. References to tickets 05–16 and 16 above point into the nitro-tray feature (`/scratch/nitro-tray/issues/`), where the machine-specific evidence and decisions live.
+2026-08-08: Moved from the nitro-tray feature (was ticket 17) to this feature dir on the tracker; renumbered to 01. Machine-specific firmware evidence and decisions live in `docs/firmware-notes.md` (the nitro-tray feature tickets were deleted when the notes were distilled).

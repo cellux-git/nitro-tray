@@ -2,9 +2,9 @@
 //! the system usage mode. A HID write failure is never fatal — callers log it
 //! and continue with WMI profile + plan.
 //!
-//! Encodings match the proven AeroForge tables (prior art section 2): 65-byte
-//! feature reports with a 9-byte prefix `A0 00 A0 01 00 01 <mode> 00 00` on
-//! the device whose path contains `hid#1025174b&col01#` (VID 0x1025).
+//! Encodings match the proven AeroForge tables (see `docs/firmware-notes.md`):
+//! 65-byte feature reports with a 9-byte prefix `A0 00 A0 01 00 01 <mode> 00 00`
+//! on the device whose path contains `hid#1025174b&col01#` (VID 0x1025).
 
 use std::mem::size_of;
 
@@ -35,7 +35,7 @@ const REPORT_LEN: u32 = 65;
 const WRITE_ATTEMPTS: u32 = 4;
 const WRITE_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(750);
 
-/// Device-path marker for the usage-mode collection (lowercase, prior art).
+/// Device-path marker for the usage-mode collection (lowercase).
 const DEVICE_PATH_MARKER: &str = "hid#1025174b&col01#";
 
 // windows-sys 0.61 puts `CreateFileW` in `Win32::Storage::FileSystem`
@@ -58,8 +58,8 @@ unsafe extern "system" {
     ) -> HANDLE;
 }
 
-/// Usage-mode feature report prefix (prior art: `A0 00 A0 01 00 01 <mode>
-/// 00 00`; Performance=1, Normal=2, Quiet=3). Pure encoding, unit-tested.
+/// Usage-mode feature report prefix (`A0 00 A0 01 00 01 <mode> 00 00`;
+/// Performance=1, Normal=2, Quiet=3). Pure encoding, unit-tested.
 pub fn usage_mode_report(mode: HidMode) -> [u8; 9] {
     let mode_byte = match mode {
         HidMode::Performance => 0x01,
@@ -185,10 +185,10 @@ impl<T: HidTransport> HidAdapter<T> {
         }
     }
 
-    /// Raw 65-byte feature-report readback (prior art): sends a feature
-    /// request with `[0]=0xA0` (`HidD_GetFeature`) and returns the device's
-    /// raw response — the probe's write-path readback. Diagnostic surface:
-    /// the probe prints the response hex, the adapter decodes nothing.
+    /// Raw 65-byte feature-report readback: sends a feature request with
+    /// `[0]=0xA0` (`HidD_GetFeature`) and returns the device's raw response —
+    /// the probe's write-path readback. Diagnostic surface: the probe prints
+    /// the response hex, the adapter decodes nothing.
     pub fn raw_readback(&self) -> Result<[u8; 65], HidError> {
         let mut buf = [0u8; REPORT_LEN as usize];
         buf[0] = 0xA0;
@@ -197,11 +197,10 @@ impl<T: HidTransport> HidAdapter<T> {
     }
 
     /// Best-effort usage-mode readback. The device protocol exposes NO
-    /// usage-mode status (prior art's only status readback is a sensor
-    /// probe); this sends the status request with selector 1 and decodes the
-    /// raw u16 as a mode byte only when it exactly matches a known mode
-    /// (1/2/3). Any other value means the device answered with a sensor
-    /// reading — returned as `HidError::Io`.
+    /// usage-mode status readback; this sends the status request with selector
+    /// 1 and decodes the raw u16 as a mode byte only when it exactly matches a
+    /// known mode (1/2/3). Any other value means the device answered with a
+    /// sensor reading — returned as `HidError::Io`.
     pub fn read_usage_mode(&self) -> Result<HidMode, HidError> {
         let mut buf = [0u8; REPORT_LEN as usize];
         buf[0] = 0xA0;
@@ -328,7 +327,7 @@ unsafe fn device_interface_path(
     Some(path)
 }
 
-/// Open a device path with the prior-art share modes. `None` on failure.
+/// Open a device path with the documented share modes. `None` on failure.
 unsafe fn open_device(path: &str) -> Option<HANDLE> {
     let mut wide: Vec<u16> = path.encode_utf16().collect();
     wide.push(0);

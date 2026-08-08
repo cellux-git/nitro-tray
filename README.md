@@ -137,7 +137,7 @@ by the app, the tests, or the build.
 
 ## Development
 
-The hardware opcode tables are documented in `.scratch/nitro-tray/prior-art-aeroforge.md`.
+Hardware opcode tables and firmware encodings are documented in `docs/firmware-notes.md`.
 
 ```text
 cargo build
