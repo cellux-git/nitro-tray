@@ -81,6 +81,18 @@ unsafe impl<M: MiTransport> Send for WmiAdapter<M> {}
 unsafe impl<M: MiTransport> Sync for WmiAdapter<M> {}
 
 impl<M: MiTransport> WmiAdapter<M> {
+    /// Connect through the per-platform transport seam (the transport is the
+    /// per-platform module now): Windows `MiConnection` initiates the MI
+    /// client and a local session; the Linux `MiConnection` stub returns
+    /// `NOT_FOUND`, mapped to `NotAvailable` by `map_mi` — the entry point
+    /// degrades exactly like the old hardcoded stub. Session creation does
+    /// not talk to the provider, so reachability is proven by the first
+    /// operation; failures trip the circuit breaker and the recovery loop
+    /// reconnects.
+    pub fn connect() -> Result<Self, AdapterError> {
+        <M as MiTransport>::connect().map_err(map_mi).map(Self::with_transport)
+    }
+
     /// Wrap any `MiTransport` (the test seam).
     pub fn with_transport(transport: M) -> Self {
         Self {
@@ -178,29 +190,6 @@ impl<M: MiTransport> WmiAdapter<M> {
                 None => Err(AdapterError::Unexpected(format!("{method}: no gmOutput"))),
             },
         }
-    }
-}
-
-#[cfg(windows)]
-impl WmiAdapter<MiConnection> {
-    /// Connect to `ROOT\WMI` via in-process MI (`mi.dll`): initializes the MI
-    /// client and a local session. Session creation does not talk to the
-    /// provider, so reachability is proven by the first operation; failures
-    /// trip the circuit breaker and the recovery loop reconnects.
-    pub fn connect() -> Result<Self, AdapterError> {
-        let transport = MiConnection::connect().map_err(map_mi)?;
-        Ok(Self::with_transport(transport))
-    }
-}
-
-/// Linux stub (linux-port ticket 02): `MiConnection` reports unavailable, so
-/// `connect()` degrades to `NotAvailable` — the entry point logs "running
-/// degraded" exactly like the Windows fallback path. The ticket-03 chardev
-/// transport replaces the `MiConnection::connect()` body only.
-#[cfg(target_os = "linux")]
-impl WmiAdapter<MiConnection> {
-    pub fn connect() -> Result<Self, AdapterError> {
-        Err(AdapterError::NotAvailable)
     }
 }
 

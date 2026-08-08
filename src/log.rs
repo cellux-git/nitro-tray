@@ -69,6 +69,21 @@ pub fn error(message: impl AsRef<str>) {
     write_line("ERROR", message.as_ref(), false);
 }
 
+/// Route panics into the log (with a backtrace) instead of dying silently on
+/// stderr, which is invisible for the GUI-subsystem Windows binary and
+/// possibly absent in GUI-less Linux sessions. Shared by both entry points.
+pub fn install_panic_hook() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        error(format!("PANIC: {info}"));
+        let backtrace = std::backtrace::Backtrace::capture();
+        if backtrace.status() == std::backtrace::BacktraceStatus::Captured {
+            error(format!("backtrace:\n{backtrace}"));
+        }
+        default_hook(info);
+    }));
+}
+
 fn write_line(level: &str, message: &str, debug: bool) {
     let state = match STATE.lock() {
         Ok(state) => state,

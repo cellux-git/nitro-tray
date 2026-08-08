@@ -84,6 +84,46 @@ deliberately unmapped — not a user profile). Single source:
   is never reset mid-instance); nothing is terminal — enforcement re-runs on
   reconnect and the tray view refreshes by itself.
 
+## Keyboard RGB surface (verified on-device 2026-08-08)
+
+The AN16S-61 has a 4-zone RGB keyboard with its own WMI surface beside the
+plain `SetGamingKBBacklight` the app uses. All encodings below were verified by
+writes plus readbacks. The readbacks are **stored config, not live state** —
+they do not change when effects play or when the EC blinks the keyboard.
+
+- **Zones** (`SetGamingRgbKb` / `GetGamingRgbKb`): per-zone color, four zones
+  selected by mask bits 1/2/4/8. Write encoding: `mask | R << 8 | G << 16 |
+  B << 24`. The stored zone color on this SKU is `0x329000` = `(R=0x90, G=0x32,
+  B=0)` — orange, the same color the keyboard blinks on profile change.
+  `GetGamingRgbKb` returns the same `0x329000` for masks 1/2/4/8; masks with
+  higher bits (16..128) read back `0x1`, and `0xFF` reads back `0`.
+- **Effect mode** (`SetGamingLEDBehavior` / `GetGamingLEDBehavior`): write
+  `(mode << 8) | 1` (low bit = apply). Stored mode on this SKU: 1 (static).
+  Modes 0..16 are all accepted (return 1), but the readback does not track the
+  write.
+- **Zone color apply** (`SetGamingLEDColor` / `GetGamingLEDColor`): write with
+  the low bit set; low byte 1..8 is the valid range.
+- **Set return codes are input-validity indicators, not success flags**: the
+  working writes (profile, fan, keyboard-off) return 0; the LED-family methods
+  return 1 for valid inputs and 2 for invalid (e.g. low byte 0 or > 8). A
+  return of 1 does **not** mean the write applied.
+- **`SetGamingKBBacklight`** (the app's keyboard-off path): the 16-byte write
+  is `[mode, speed, intensity, direction, 0, R, G, B, 0, apply, ...]`. The
+  15-byte readback tracks the intensity byte live (0 → 255 → 0 on write) but
+  keeps the stored zone RGB — the array's R/G/B bytes do not overwrite the
+  zone colors. Keyboard off = intensity 0 (what `keyboard_led_off` does).
+- **`SetGamingLED`** (16-byte array) exists but every tested payload returned
+  the invalid code 2; its function on this SKU is unknown. Its `GetGamingLED`
+  readback record (15 bytes, `[0,0,0,0,15,213,0,0,...]` on this SKU) never
+  changed through any write or the blink — treated as a static SKU descriptor.
+- **The orange blink on profile change is the keyboard**, driven by the EC as
+  feedback; the lid logo stays constant (see below).
+
+## Lid logo backlight — investigated, not figured out
+
+The lid logo backlight on this SKU is controlled by the EC, but no software
+interface to set its state was found (investigated 2026-08-08 on-device).
+
 ## Diagnostics
 
 `src/bin/probe_wmi.rs`, `probe_charge.rs`, `probe_charge_read.rs`,

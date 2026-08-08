@@ -14,11 +14,12 @@ mod probe {
     use std::time::Duration;
 
     use nitro_tray::adapter::WMI_NAMESPACE;
+    use nitro_tray::mi::MiConnection;
     use nitro_tray::policy::Profile;
     use nitro_tray::wmi::{CLASS_NAME, WmiAdapter};
 
     pub fn run() {
-        let adapter = match WmiAdapter::connect() {
+        let adapter = match WmiAdapter::<MiConnection>::connect() {
             Ok(adapter) => adapter,
             Err(e) => {
                 eprintln!("connect failed: {e:?}");

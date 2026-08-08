@@ -18,6 +18,7 @@ use std::rc::Rc;
 
 use crate::hid::{HidError, HidTransport};
 use crate::mi::{MiError, MiResult};
+use crate::policy::Profile;
 use crate::power::{PlanApi, PowerError};
 use crate::transport::{MiInput, MiOutput, MiTransport};
 
@@ -293,10 +294,10 @@ fn pop_repeating<T: Clone>(queue: &mut Vec<T>) -> Option<T> {
     }
 }
 
-/// Scripted `PlanApi`: queued outcomes for `ensure_nitro_plans`,
-/// `set_active_plan` and `active_plan_name` (last entry repeats forever; an
-/// unscripted method succeeds with a sensible default — the plan API is not
-/// the panic-on-unscripted kind, failures are scripted explicitly). Records
+/// Scripted `PlanApi`: queued outcomes for `ensure_support`, `set_profile`
+/// and `active_profile` (last entry repeats forever; an unscripted method
+/// succeeds with a sensible default — the plan API is not the
+/// panic-on-unscripted kind, failures are scripted explicitly). Records
 /// every invocation so the apply/reconnect paths can be pinned by call
 /// counts and arguments.
 #[derive(Clone, Default)]
@@ -306,12 +307,12 @@ pub struct FakePlanApi {
 
 #[derive(Default)]
 struct FakePlanApiInner {
-    ensure_outcomes: RefCell<Vec<Result<(), PowerError>>>,
+    support_outcomes: RefCell<Vec<Result<(), PowerError>>>,
     set_outcomes: RefCell<Vec<Result<(), PowerError>>>,
-    name_outcomes: RefCell<Vec<Result<String, PowerError>>>,
-    ensure_calls: RefCell<usize>,
-    set_calls: RefCell<Vec<String>>,
-    name_calls: RefCell<usize>,
+    profile_outcomes: RefCell<Vec<Result<Option<Profile>, PowerError>>>,
+    support_calls: RefCell<usize>,
+    set_calls: RefCell<Vec<Profile>>,
+    profile_calls: RefCell<usize>,
 }
 
 impl FakePlanApi {
@@ -320,65 +321,66 @@ impl FakePlanApi {
         Self::default()
     }
 
-    /// Script `ensure_nitro_plans` outcomes; the last entry repeats forever.
+    /// Script `ensure_support` outcomes; the last entry repeats forever.
     pub fn script_ensure(&self, outcomes: Vec<Result<(), PowerError>>) -> &Self {
         assert!(!outcomes.is_empty(), "FakePlanApi: empty ensure script");
-        *self.inner.ensure_outcomes.borrow_mut() = outcomes;
+        *self.inner.support_outcomes.borrow_mut() = outcomes;
         self
     }
 
-    /// Script `set_active_plan` outcomes; the last entry repeats forever.
+    /// Script `set_profile` outcomes; the last entry repeats forever.
     pub fn script_set(&self, outcomes: Vec<Result<(), PowerError>>) -> &Self {
         assert!(!outcomes.is_empty(), "FakePlanApi: empty set script");
         *self.inner.set_outcomes.borrow_mut() = outcomes;
         self
     }
 
-    /// Script `active_plan_name` outcomes; the last entry repeats forever.
-    pub fn script_name(&self, outcomes: Vec<Result<String, PowerError>>) -> &Self {
-        assert!(!outcomes.is_empty(), "FakePlanApi: empty name script");
-        *self.inner.name_outcomes.borrow_mut() = outcomes;
+    /// Script `active_profile` outcomes; the last entry repeats forever.
+    pub fn script_active_profile(&self, outcomes: Vec<Result<Option<Profile>, PowerError>>) -> &Self {
+        assert!(!outcomes.is_empty(), "FakePlanApi: empty active-profile script");
+        *self.inner.profile_outcomes.borrow_mut() = outcomes;
         self
     }
 
-    /// Number of `ensure_nitro_plans` invocations.
+    /// Number of `ensure_support` invocations.
     pub fn ensure_calls(&self) -> usize {
-        *self.inner.ensure_calls.borrow()
+        *self.inner.support_calls.borrow()
     }
 
-    /// The plan names passed to `set_active_plan`, in call order.
+    /// The profiles passed to `set_profile`, as their plan names, in call
+    /// order.
     pub fn set_calls(&self) -> Vec<String> {
-        self.inner.set_calls.borrow().clone()
+        self.inner.set_calls.borrow().iter().map(|p| p.plan_name().to_string()).collect()
     }
 
-    /// Number of `active_plan_name` invocations.
-    pub fn name_calls(&self) -> usize {
-        *self.inner.name_calls.borrow()
+    /// Number of `active_profile` invocations.
+    pub fn profile_calls(&self) -> usize {
+        *self.inner.profile_calls.borrow()
     }
 }
 
 impl PlanApi for FakePlanApi {
-    fn ensure_nitro_plans(&self) -> Result<(), PowerError> {
-        *self.inner.ensure_calls.borrow_mut() += 1;
-        match pop_repeating(&mut self.inner.ensure_outcomes.borrow_mut()) {
+    fn ensure_support(&self) -> Result<(), PowerError> {
+        *self.inner.support_calls.borrow_mut() += 1;
+        match pop_repeating(&mut self.inner.support_outcomes.borrow_mut()) {
             Some(outcome) => outcome,
             None => Ok(()),
         }
     }
 
-    fn set_active_plan(&self, plan: &str) -> Result<(), PowerError> {
-        self.inner.set_calls.borrow_mut().push(plan.to_string());
+    fn set_profile(&self, profile: Profile) -> Result<(), PowerError> {
+        self.inner.set_calls.borrow_mut().push(profile);
         match pop_repeating(&mut self.inner.set_outcomes.borrow_mut()) {
             Some(outcome) => outcome,
             None => Ok(()),
         }
     }
 
-    fn active_plan_name(&self) -> Result<String, PowerError> {
-        *self.inner.name_calls.borrow_mut() += 1;
-        match pop_repeating(&mut self.inner.name_outcomes.borrow_mut()) {
+    fn active_profile(&self) -> Result<Option<Profile>, PowerError> {
+        *self.inner.profile_calls.borrow_mut() += 1;
+        match pop_repeating(&mut self.inner.profile_outcomes.borrow_mut()) {
             Some(outcome) => outcome,
-            None => Ok("Nitro-Balanced".to_string()),
+            None => Ok(Some(Profile::Balanced)),
         }
     }
 }
@@ -388,6 +390,7 @@ mod tests {
     use super::{FakeHidTransport, FakePlanApi};
     use crate::hid::HidTransport;
     use crate::mi::{MiError, MI_RESULT_FAILED, MI_RESULT_NOT_FOUND};
+    use crate::policy::Profile;
     use crate::power::PlanApi;
     use crate::testing::{FakeTransport, no_output, some_output, transport_error};
     use crate::transport::{MiInput, MiOutput, MiTransport};
@@ -528,14 +531,14 @@ mod tests {
         use crate::power::PowerError;
         let plan = FakePlanApi::new();
         plan.script_set(vec![Err(PowerError::NotFound("Nitro-X".into()))]);
-        assert_eq!(plan.ensure_nitro_plans(), Ok(()));
-        assert_eq!(plan.set_active_plan("Nitro-A"), Err(PowerError::NotFound("Nitro-X".into())));
-        assert_eq!(plan.set_active_plan("Nitro-B"), Err(PowerError::NotFound("Nitro-X".into())));
-        assert_eq!(plan.active_plan_name().as_deref(), Ok("Nitro-Balanced"));
+        assert_eq!(plan.ensure_support(), Ok(()));
+        assert_eq!(plan.set_profile(Profile::Quiet), Err(PowerError::NotFound("Nitro-X".into())));
+        assert_eq!(plan.set_profile(Profile::Performance), Err(PowerError::NotFound("Nitro-X".into())));
+        assert_eq!(plan.active_profile(), Ok(Some(Profile::Balanced)));
         assert_eq!(plan.ensure_calls(), 1);
-        assert_eq!(plan.set_calls(), vec!["Nitro-A".to_string(), "Nitro-B".to_string()]);
-        assert_eq!(plan.name_calls(), 1);
-        plan.script_name(vec![Ok("Nitro-Performance".into())]);
-        assert_eq!(plan.active_plan_name().as_deref(), Ok("Nitro-Performance"));
+        assert_eq!(plan.set_calls(), vec!["Nitro-Quiet".to_string(), "Nitro-Performance".to_string()]);
+        assert_eq!(plan.profile_calls(), 1);
+        plan.script_active_profile(vec![Ok(Some(Profile::Performance))]);
+        assert_eq!(plan.active_profile(), Ok(Some(Profile::Performance)));
     }
 }

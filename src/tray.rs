@@ -1,8 +1,10 @@
-//! Tray UI: static icon in the system tray, left-click opens the menu, menu
-//! and tooltip show the *read-back* effective state, balloon notifications,
-//! and a degraded "Hardware unavailable" state when the Acer WMI interface is
-//! unreachable. The tray window also owns the power-notification and timer
-//! plumbing that feeds the app core.
+//! Win32 tray plumbing: static icon in the system tray, left-click opens the
+//! menu, menu and tooltip show the *read-back* effective state, balloon
+//! notifications, and a degraded "Hardware unavailable" state when the Acer
+//! WMI interface is unreachable. The tray window also owns the
+//! power-notification and timer plumbing that feeds the app core. The pure
+//! menu model (view, neutral items, tooltip text, id constants) lives in
+//! `tray_model.rs` — shared, both platforms.
 
 use std::cell::{Cell, RefCell};
 use std::ffi::c_void;
@@ -43,6 +45,10 @@ use crate::log;
 use crate::policy::{profiles_for, PowerState, Profile};
 use crate::power_state::{self, PowerStateSnapshot};
 use crate::timers;
+use crate::tray_model::{
+    menu_items, plans_for, tooltip_text, MenuItem, TrayEvent, TrayView, MENU_LOGON_TASK,
+    MENU_PLAN_BASE, MENU_PROFILE_BASE, MENU_QUIT, SMART_CHARGE_LABEL,
+};
 
 /// Hidden window class (tray icon owner, power notifications, poll timer).
 /// The class name is a `w!` literal (the macro takes literals only).
@@ -52,10 +58,6 @@ const TRAY_MSG: u32 = WM_APP + 1;
 /// Posted after every channel send to wake the GetMessageW pump.
 const WAKE_MSG: u32 = WM_APP + 2;
 const POLL_TIMER_ID: usize = 1;
-const MENU_PROFILE_BASE: usize = 1;
-const MENU_PLAN_BASE: usize = 300;
-const MENU_QUIT: usize = 200;
-const MENU_LOGON_TASK: usize = 400;
 const ICON_SIZE: i32 = 16;
 /// Explorer's taskbar window; its notification area is what `NIM_ADD`
 /// registers into. Waiting for it before the first `Shell_NotifyIconW` call
@@ -75,62 +77,6 @@ const NIM_ADD_RETRY_MS: u64 = 1_000;
 const GUID_ACDC_POWER_SOURCE: GUID = GUID::from_u128(0x5d3e9a59_e9d5_4b00_a6bd_ff34ff516548);
 
 static CLASS_REGISTERED: AtomicBool = AtomicBool::new(false);
-
-/// Events raised by the tray window (menu picks, power messages, timers).
-/// The main loop drains the channel and drives the app core.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TrayEvent {
-    /// The user chose Quit.
-    Quit,
-    /// The user toggled the "Start at logon" checkbox.
-    ToggleLogonTask,
-    /// The user picked a profile in the menu.
-    SelectProfile(Profile),
-    /// Power status changed (WM_POWERBROADCAST or slow poll fallback).
-    PowerChanged,
-    /// The machine resumed from sleep (WM_POWERBROADCAST).
-    Resume,
-    /// The global profile-cycle hotkey was pressed (WM_HOTKEY).
-    HotkeyPressed,
-    /// The reapply timer ticked (WM_TIMER, timers::REAPPLY_TIMER_ID).
-    ReapplyTick,
-    /// The recovery timer ticked (WM_TIMER, timers::RECOVERY_TIMER_ID):
-    /// retry adapters that failed their circuit breaker.
-    RecoveryTick,
-    /// The periodic readback timer ticked (WM_TIMER, timers::READBACK_TIMER_ID).
-    ReadbackTick,
-    /// The user picked a Windows plan in the degraded-mode plan section.
-    SelectPlan(Profile),
-}
-
-/// The view the main loop pushes into the tray after each state change:
-/// read-back effective-state facts. The tray derives the menu contents
-/// (profile list per power state, greys, degraded "Windows plan" section,
-/// smart-charge intent fallback) from these facts in `menu_items`.
-#[derive(Clone, Debug)]
-pub struct TrayView {
-    pub power: PowerState,
-    pub percent: u8,
-    /// Current effective profile (checked in the menu); `None` when unknown.
-    pub profile: Option<Profile>,
-    /// Show the degraded "Hardware unavailable" state: profile items greyed,
-    /// "Windows plan" section offered instead.
-    pub degraded: bool,
-    /// Grey out just the eco entry (firmware rejected profile 6).
-    pub eco_disabled: bool,
-    /// Read-back smart-charge state; `None` when unavailable. The menu treats
-    /// `None` as the intent — smart charge is always intended on — showing
-    /// the "Smart charge (80% cap)" line checked unless the readback says off.
-    pub smart_charge: Option<bool>,
-    /// Active Windows plan name; `None` when unknown.
-    pub plan: Option<String>,
-    /// Ephemeral status line at the bottom of the menu: last apply outcome
-    /// ("Applied" / "Failed: ..."), shown only until the menu is dismissed.
-    /// `None` = no line.
-    pub status: Option<String>,
-    /// "Start at logon" checkbox state (logon scheduled task installed).
-    pub start_at_logon: bool,
-}
 
 /// Errors from tray creation/updates.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -197,6 +143,8 @@ impl Tray {
                     percent: 0,
                     profile: None,
                     degraded: false,
+                    profiles_greyed: false,
+                    plan_section: false,
                     eco_disabled: false,
                     smart_charge: None,
                     plan: None,
@@ -461,120 +409,6 @@ fn poll_power(state: &TrayState) {
     }
 }
 
-/// One derived menu entry: the raw `AppendMenuW` flags, the item id, and the
-/// label. Separators are `MF_SEPARATOR` entries with an empty label.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct MenuItem {
-    /// Menu item id (`AppendMenuW` `uID`); 0 for non-routable items.
-    pub id: usize,
-    /// `MF_*` / `MFT_*` flag bits passed to `AppendMenuW`.
-    pub flags: u32,
-    /// Item text; empty for separators.
-    pub label: String,
-}
-
-/// The degraded-mode "Windows plan" section: the power state's profiles when
-/// the WMI interface is unavailable (the firmware profile section is
-/// unusable), else empty. Single derivation — the menu model and the id
-/// routing both go through this, so the plan ids cannot drift apart.
-fn plans_for(view: &TrayView) -> &'static [Profile] {
-    if view.degraded {
-        profiles_for(view.power)
-    } else {
-        &[]
-    }
-}
-
-/// Derive the full popup-menu model from the effective-state facts: the
-/// logon checkbox, the degraded "Hardware unavailable" banner, the profile
-/// items for the current power state (radio, checked for the effective
-/// profile, greyed when degraded or the eco entry is firmware-rejected), the
-/// smart-charge intent-fallback status line, the plan line, the degraded-mode
-/// "Windows plan" section, Quit, and the ephemeral status line. Pure — no
-/// window, no Win32 — so the menu is unit-testable directly.
-pub fn menu_items(view: &TrayView) -> Vec<MenuItem> {
-    let mut items = Vec::new();
-    let logon_label = if view.start_at_logon {
-        "\u{2611} Start at logon" // ☑
-    } else {
-        "\u{2610} Start at logon" // ☐
-    };
-    items.push(menu_entry(MF_STRING, MENU_LOGON_TASK, logon_label));
-    items.push(separator_entry());
-    if view.degraded {
-        items.push(menu_entry(MF_GRAYED | MF_DISABLED, 0, "Hardware unavailable"));
-        items.push(separator_entry());
-    }
-    let profile_flags = if view.degraded {
-        MF_GRAYED | MF_DISABLED
-    } else {
-        0
-    };
-    for (i, profile) in profiles_for(view.power).iter().enumerate() {
-        let mut flags = profile_flags
-            | MFT_RADIOCHECK
-            | if Some(*profile) == view.profile {
-                MF_CHECKED
-            } else {
-                0
-            };
-        if view.eco_disabled && *profile == Profile::Eco {
-            flags |= MF_GRAYED | MF_DISABLED;
-        }
-        items.push(menu_entry(flags, MENU_PROFILE_BASE + i, profile_label(*profile)));
-    }
-    items.push(separator_entry());
-    // Smart charge is always intended on and cannot be disabled in the app;
-    // the item is a static status line (checked unless the readback says the
-    // cap is not in effect — a `None` readback means the intent holds).
-    let smart_flags = MF_DISABLED
-        | if view.smart_charge != Some(false) {
-            MF_CHECKED
-        } else {
-            0
-        };
-    items.push(menu_entry(smart_flags, 0, "Smart charge (80% cap)"));
-    if let Some(plan) = &view.plan {
-        items.push(menu_entry(MF_GRAYED | MF_DISABLED, 0, &format!("Plan: {plan}")));
-    }
-    // Degraded mode: the firmware profile section is unusable, so the
-    // "Windows plan" section offers the same profiles through OS plans.
-    let plans: &'static [Profile] = plans_for(view);
-    if !plans.is_empty() {
-        items.push(separator_entry());
-        items.push(menu_entry(MF_GRAYED | MF_DISABLED, 0, "Windows plan"));
-        for (i, profile) in plans.iter().enumerate() {
-            let flags = MFT_RADIOCHECK
-                | if Some(*profile) == view.profile {
-                    MF_CHECKED
-                } else {
-                    0
-                };
-            items.push(menu_entry(flags, MENU_PLAN_BASE + i, profile_label(*profile)));
-        }
-    }
-    items.push(separator_entry());
-    items.push(menu_entry(MF_STRING, MENU_QUIT, "Quit"));
-    // Ephemeral status line: the last apply outcome; cleared on dismissal
-    // (no history is kept).
-    if let Some(status) = &view.status {
-        items.push(separator_entry());
-        items.push(menu_entry(MF_GRAYED | MF_DISABLED, 0, status));
-    }
-    items
-}
-
-fn separator_entry() -> MenuItem {
-    menu_entry(MF_SEPARATOR, 0, "")
-}
-
-fn menu_entry(flags: u32, id: usize, label: &str) -> MenuItem {
-    MenuItem {
-        id,
-        flags,
-        label: label.to_string(),
-    }
-}
 /// Build the popup menu from the stored view (via the derived `menu_items`
 /// model) and route the picked id.
 fn open_menu(hwnd: HWND, state: &TrayState) {
@@ -590,11 +424,8 @@ fn open_menu(hwnd: HWND, state: &TrayState) {
         return;
     }
     for item in &items {
-        if item.flags & MF_SEPARATOR != 0 {
-            append_separator(menu);
-        } else {
-            append_item(menu, item.flags, item.id, &item.label);
-        }
+        let flags = append_flags(item, profiles.len(), plans.len());
+        append_item(menu, flags, item.id, &item.label);
     }
 
     let mut pt = POINT::default();
@@ -638,10 +469,30 @@ fn open_menu(hwnd: HWND, state: &TrayState) {
     }
 }
 
-fn append_separator(menu: HMENU) {
-    unsafe {
-        AppendMenuW(menu, MF_SEPARATOR, 0, ptr::null());
+/// Win32 `AppendMenuW` flags for one neutral menu item: separators map to
+/// `MF_SEPARATOR`; everything else is `MF_STRING` plus `MF_DISABLED` when
+/// disabled, `MF_CHECKED` when checked, `MFT_RADIOCHECK` when the id falls
+/// in the profile or plan range, and `MF_GRAYED` for disabled items that are
+/// neither radio nor checked — except the smart-charge status line, which is
+/// disabled but stays black (`MF_DISABLED` only, exactly as before) even
+/// when its readback says off and the checkmark is absent. The label keys
+/// that one special case (the neutral model cannot distinguish the line).
+/// Pure — the unit test pins the mapping byte-identical to the pre-ticket
+/// menu.
+fn append_flags(item: &MenuItem, profile_count: usize, plan_count: usize) -> u32 {
+    if item.separator {
+        return MF_SEPARATOR;
     }
+    let radio = (MENU_PROFILE_BASE..MENU_PROFILE_BASE + profile_count).contains(&item.id)
+        || (MENU_PLAN_BASE..MENU_PLAN_BASE + plan_count).contains(&item.id);
+    let greyed = !item.enabled
+        && (radio || !item.checked)
+        && item.label != SMART_CHARGE_LABEL;
+    MF_STRING
+        | if item.enabled { 0 } else { MF_DISABLED }
+        | if greyed { MF_GRAYED } else { 0 }
+        | if item.checked { MF_CHECKED } else { 0 }
+        | if radio { MFT_RADIOCHECK } else { 0 }
 }
 
 fn append_item(menu: HMENU, flags: u32, id: usize, label: &str) {
@@ -649,40 +500,6 @@ fn append_item(menu: HMENU, flags: u32, id: usize, label: &str) {
     unsafe {
         AppendMenuW(menu, flags, id, wide.as_ptr());
     }
-}
-
-fn profile_label(profile: Profile) -> &'static str {
-    match profile {
-        Profile::Quiet => "Quiet",
-        Profile::Balanced => "Balanced",
-        Profile::Performance => "Performance",
-        Profile::Eco => "Eco",
-    }
-}
-
-/// The tooltip text: first line is the state summary, second line the plan and
-/// smart-charge state. `\n\n\n` is the standard two-line tooltip trick.
-pub fn tooltip_text(view: &TrayView) -> String {
-    let status = if view.degraded {
-        "Hardware unavailable"
-    } else {
-        "Nitro Tray"
-    };
-    let power = match view.power {
-        PowerState::Ac => "AC",
-        PowerState::Battery => "Battery",
-    };
-    let profile = view.profile.map(|p| p.as_str()).unwrap_or("unknown");
-    let smart = match view.smart_charge {
-        Some(true) => "on",
-        Some(false) => "off",
-        None => "unknown",
-    };
-    let plan = view.plan.as_deref().unwrap_or("unknown");
-    format!(
-        "{status} — {percent}% | {profile} | {power}\n\n\n{plan} | Smart charge {smart}",
-        percent = view.percent,
-    )
 }
 
 /// 16x16 battery glyph drawn into a 32bpp top-down DIB, plus a monochrome
@@ -789,66 +606,92 @@ mod tests {
     use super::*;
     use crate::policy::Profile;
 
-    fn view(power: PowerState, percent: u8, profile: Option<Profile>, plan: Option<&str>) -> TrayView {
-        TrayView {
-            power,
-            percent,
-            profile,
-            degraded: false,
+    /// The append-time `MF_*`/`MFT_*` mapping, pinned byte-identical to the
+    /// pre-ticket Windows menu: the degraded battery view (every item kind
+    /// present) with the exact `AppendMenuW` flag bits per item.
+    #[test]
+    fn append_flags_byte_identical_to_pre_ticket_menu() {
+        let v = TrayView {
+            power: PowerState::Battery,
+            percent: 42,
+            profile: Some(Profile::Eco),
+            degraded: true,
+            profiles_greyed: true,
+            plan_section: true,
             eco_disabled: false,
             smart_charge: None,
-            plan: plan.map(String::from),
-            status: None,
-            start_at_logon: false,
-        }
+            plan: Some("Nitro-Eco".to_string()),
+            status: Some("Applied".to_string()),
+            start_at_logon: true,
+        };
+        let items = menu_items(&v);
+        let flags: Vec<u32> = items
+            .iter()
+            .map(|item| append_flags(item, profiles_for(v.power).len(), plans_for(&v).len()))
+            .collect();
+        assert_eq!(
+            flags,
+            vec![
+                MF_STRING, // logon checkbox
+                MF_SEPARATOR, //
+                MF_GRAYED | MF_DISABLED, // "Hardware unavailable" banner
+                MF_SEPARATOR, //
+                MFT_RADIOCHECK | MF_CHECKED | MF_GRAYED | MF_DISABLED, // eco (greyed + checked)
+                MFT_RADIOCHECK | MF_GRAYED | MF_DISABLED, // balanced (greyed)
+                MF_SEPARATOR, //
+                MF_DISABLED | MF_CHECKED, // smart charge (checked)
+                MF_GRAYED | MF_DISABLED, // plan line
+                MF_SEPARATOR, //
+                MF_GRAYED | MF_DISABLED, // "Windows plan" header
+                MFT_RADIOCHECK | MF_CHECKED, // plan eco (checked)
+                MFT_RADIOCHECK, // plan balanced
+                MF_SEPARATOR, //
+                MF_STRING, // quit
+                MF_SEPARATOR, //
+                MF_GRAYED | MF_DISABLED, // status line
+            ]
+        );
     }
 
     #[test]
-    fn tooltip_contains_all_read_back_values() {
+    fn append_flags_smart_charge_off_stays_disabled_not_greyed() {
+        // Pre-ticket: the smart-charge line is `MF_DISABLED` only (black,
+        // unclickable, no checkmark) when the readback says off — greyed
+        // would be a visual change, and every other disabled line (banner,
+        // plan line, "Windows plan" header, status) greys.
         let v = TrayView {
             power: PowerState::Ac,
-            percent: 87,
-            profile: Some(Profile::Balanced),
-            degraded: false,
+            percent: 50,
+            profile: None,
+            degraded: true,
+            profiles_greyed: true,
+            plan_section: true,
             eco_disabled: false,
-            smart_charge: Some(true),
-            plan: Some("Nitro-Balanced".to_string()),
-            status: None,
+            smart_charge: Some(false),
+            plan: Some("Nitro-Quiet".to_string()),
+            status: Some("Applied".to_string()),
             start_at_logon: false,
         };
-        let text = tooltip_text(&v);
-        assert!(text.contains("Nitro Tray"));
-        assert!(text.contains("87%"));
-        assert!(text.contains("balanced"));
-        assert!(text.contains("AC"));
-        assert!(text.contains("Nitro-Balanced"));
-        assert!(text.contains("Smart charge on"));
-        assert!(text.contains("\n\n\n"));
-    }
-
-    #[test]
-    fn tooltip_battery_power_state() {
-        let v = view(PowerState::Battery, 42, Some(Profile::Eco), Some("Nitro-Eco"));
-        let text = tooltip_text(&v);
-        assert!(text.contains("Battery"));
-        assert!(text.contains("eco"));
-        assert!(text.contains("Nitro-Eco"));
-    }
-
-    #[test]
-    fn tooltip_smart_charge_off() {
-        let mut v = view(PowerState::Ac, 50, None, None);
-        v.smart_charge = Some(false);
-        assert!(tooltip_text(&v).contains("Smart charge off"));
-    }
-
-    #[test]
-    fn tooltip_unknowns_and_degraded() {
-        let mut v = view(PowerState::Battery, 255, None, None);
-        v.degraded = true;
-        let text = tooltip_text(&v);
-        assert!(text.starts_with("Hardware unavailable"));
-        assert!(text.contains("unknown"));
+        let items = menu_items(&v);
+        let smart = items
+            .iter()
+            .find(|item| item.label == SMART_CHARGE_LABEL)
+            .expect("smart-charge line present");
+        assert!(!smart.checked);
+        assert_eq!(
+            append_flags(smart, profiles_for(v.power).len(), plans_for(&v).len()),
+            MF_DISABLED,
+            "smart-charge off: disabled but not greyed (pre-ticket 0x2)"
+        );
+        for item in items {
+            let flags = append_flags(&item, profiles_for(v.power).len(), plans_for(&v).len());
+            if item.label != SMART_CHARGE_LABEL && flags & MF_DISABLED != 0 && flags & MFT_RADIOCHECK == 0 {
+                assert!(
+                    flags & MF_GRAYED != 0,
+                    "every other disabled non-radio item greys: {item:?} -> {flags:#x}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -868,195 +711,5 @@ mod tests {
         assert_eq!(pixels[8 * 16 + 13], 0xFF_B8_C0_C8, "terminal nub");
         assert_eq!(pixels[8 * 16 + 5], 0xFF_66_CE_6B, "charge half");
         assert_eq!(pixels[8 * 16 + 10], 0xFF_3E_B0_4E, "fill half");
-    }
-
-    fn entry(flags: u32, id: usize, label: &str) -> MenuItem {
-        MenuItem {
-            id,
-            flags,
-            label: label.to_string(),
-        }
-    }
-
-    fn separator() -> MenuItem {
-        entry(MF_SEPARATOR, 0, "")
-    }
-
-    #[test]
-    fn menu_exact_normal_ac_view() {
-        let v = TrayView {
-            power: PowerState::Ac,
-            percent: 87,
-            profile: Some(Profile::Balanced),
-            degraded: false,
-            eco_disabled: false,
-            smart_charge: Some(true),
-            plan: Some("Nitro-Balanced".to_string()),
-            status: None,
-            start_at_logon: false,
-        };
-        assert_eq!(
-            menu_items(&v),
-            vec![
-                entry(MF_STRING, MENU_LOGON_TASK, "\u{2610} Start at logon"),
-                separator(),
-                entry(MFT_RADIOCHECK, MENU_PROFILE_BASE, "Quiet"),
-                entry(MFT_RADIOCHECK | MF_CHECKED, MENU_PROFILE_BASE + 1, "Balanced"),
-                entry(MFT_RADIOCHECK, MENU_PROFILE_BASE + 2, "Performance"),
-                separator(),
-                entry(MF_DISABLED | MF_CHECKED, 0, "Smart charge (80% cap)"),
-                entry(MF_GRAYED | MF_DISABLED, 0, "Plan: Nitro-Balanced"),
-                separator(),
-                entry(MF_STRING, MENU_QUIT, "Quit"),
-            ]
-        );
-    }
-
-    #[test]
-    fn menu_exact_degraded_battery_view() {
-        let v = TrayView {
-            power: PowerState::Battery,
-            percent: 42,
-            profile: Some(Profile::Eco),
-            degraded: true,
-            eco_disabled: false,
-            smart_charge: None,
-            plan: Some("Nitro-Eco".to_string()),
-            status: Some("Applied".to_string()),
-            start_at_logon: true,
-        };
-        assert_eq!(
-            menu_items(&v),
-            vec![
-                entry(MF_STRING, MENU_LOGON_TASK, "\u{2611} Start at logon"),
-                separator(),
-                entry(MF_GRAYED | MF_DISABLED, 0, "Hardware unavailable"),
-                separator(),
-                entry(
-                    MF_GRAYED | MF_DISABLED | MFT_RADIOCHECK | MF_CHECKED,
-                    MENU_PROFILE_BASE,
-                    "Eco"
-                ),
-                entry(MF_GRAYED | MF_DISABLED | MFT_RADIOCHECK, MENU_PROFILE_BASE + 1, "Balanced"),
-                separator(),
-                entry(MF_DISABLED | MF_CHECKED, 0, "Smart charge (80% cap)"),
-                entry(MF_GRAYED | MF_DISABLED, 0, "Plan: Nitro-Eco"),
-                separator(),
-                entry(MF_GRAYED | MF_DISABLED, 0, "Windows plan"),
-                entry(MFT_RADIOCHECK | MF_CHECKED, MENU_PLAN_BASE, "Eco"),
-                entry(MFT_RADIOCHECK, MENU_PLAN_BASE + 1, "Balanced"),
-                separator(),
-                entry(MF_STRING, MENU_QUIT, "Quit"),
-                separator(),
-                entry(MF_GRAYED | MF_DISABLED, 0, "Applied"),
-            ]
-        );
-    }
-
-    #[test]
-    fn menu_smart_charge_checked_unless_readback_says_off() {
-        for (readback, expect_checked) in [(None, true), (Some(true), true), (Some(false), false)] {
-            let mut v = view(PowerState::Ac, 50, None, None);
-            v.smart_charge = readback;
-            let item = menu_items(&v)
-                .into_iter()
-                .find(|i| i.label == "Smart charge (80% cap)")
-                .expect("smart-charge line present");
-            assert_eq!(item.id, 0, "readback {readback:?}");
-            assert!(item.flags & MF_DISABLED != 0, "readback {readback:?}");
-            assert_eq!(
-                item.flags & MF_CHECKED != 0,
-                expect_checked,
-                "readback {readback:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn menu_eco_disabled_greys_eco_entry_only_when_present() {
-        let mut battery = view(PowerState::Battery, 40, Some(Profile::Eco), None);
-        battery.eco_disabled = true;
-        let items = menu_items(&battery);
-        let eco = items.iter().find(|i| i.label == "Eco").expect("eco offered on battery");
-        assert!(eco.flags & MF_GRAYED != 0);
-        assert!(eco.flags & MF_DISABLED != 0);
-        let balanced = items.iter().find(|i| i.label == "Balanced").expect("balanced offered");
-        assert_eq!(balanced.flags & MF_GRAYED, 0, "only eco is greyed");
-
-        let mut ac = view(PowerState::Ac, 60, Some(Profile::Quiet), None);
-        ac.eco_disabled = true;
-        let items = menu_items(&ac);
-        assert!(
-            items.iter().all(|i| i.label != "Eco"),
-            "eco is not offered on AC"
-        );
-        for item in items {
-            assert_eq!(
-                item.flags & MF_GRAYED,
-                0,
-                "no greyed item on AC with eco_disabled: {item:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn menu_plan_line_only_when_plan_known() {
-        let mut v = view(PowerState::Ac, 50, Some(Profile::Quiet), Some("Nitro-Quiet"));
-        assert!(menu_items(&v).iter().any(|i| i.label == "Plan: Nitro-Quiet"));
-        v.plan = None;
-        assert!(!menu_items(&v).iter().any(|i| i.label.starts_with("Plan: ")));
-    }
-
-    #[test]
-    fn menu_status_line_preceded_by_separator() {
-        let mut v = view(PowerState::Ac, 50, None, None);
-        assert!(!menu_items(&v).iter().any(|i| i.label == "Applied"));
-        v.status = Some("Applied".to_string());
-        let items = menu_items(&v);
-        let idx = items.iter().position(|i| i.label == "Applied").expect("status line present");
-        assert_eq!(items[idx - 1], separator());
-        assert_eq!(items[idx].id, 0);
-        assert!(items[idx].flags & MF_GRAYED != 0);
-        assert!(items[idx].flags & MF_DISABLED != 0);
-    }
-
-    #[test]
-    fn menu_logon_glyph_follows_flag() {
-        let mut v = view(PowerState::Ac, 50, None, None);
-        v.start_at_logon = false;
-        assert_eq!(
-            menu_items(&v)[0],
-            entry(MF_STRING, MENU_LOGON_TASK, "\u{2610} Start at logon")
-        );
-        v.start_at_logon = true;
-        assert_eq!(
-            menu_items(&v)[0],
-            entry(MF_STRING, MENU_LOGON_TASK, "\u{2611} Start at logon")
-        );
-    }
-
-    #[test]
-    fn menu_quit_is_last_item() {
-        let v = view(PowerState::Ac, 50, None, None);
-        let items = menu_items(&v);
-        assert_eq!(
-            items[items.len() - 1],
-            entry(MF_STRING, MENU_QUIT, "Quit")
-        );
-    }
-
-    #[test]
-    fn menu_unknown_profile_checks_no_profile_item() {
-        let v = view(PowerState::Ac, 50, None, None);
-        for item in menu_items(&v) {
-            let is_profile = ["Quiet", "Balanced", "Performance", "Eco"].contains(&item.label.as_str());
-            if is_profile {
-                assert_eq!(
-                    item.flags & MF_CHECKED,
-                    0,
-                    "no checkmark expected in {item:?}"
-                );
-            }
-        }
     }
 }

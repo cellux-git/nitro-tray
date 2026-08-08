@@ -29,8 +29,10 @@ pub mod power_state;
 pub mod task;
 pub mod timers;
 pub mod transport;
+pub mod tray_model;
 #[cfg(windows)]
 pub mod tray;
+pub mod wiring;
 pub mod wmi;
 
 #[cfg(test)]

@@ -23,7 +23,7 @@ use crate::hid::{HidAdapter, HidTransport, RealHidTransport};
 use crate::log;
 use crate::mi::MiConnection;
 use crate::policy::{IntendedState, PolicyEngine, PowerState, Profile};
-use crate::power::{PlanApi, PowerApi};
+use crate::power::{PlanApi, PowerApi, PowerError};
 use crate::power_state::{self, PowerStateSnapshot};
 use crate::transport::MiTransport;
 use crate::wmi::WmiAdapter;
@@ -38,7 +38,8 @@ pub struct EffectiveState {
     pub percent: u8,
     /// Active firmware profile; `None` when unreadable.
     pub profile: Option<Profile>,
-    /// Active Windows plan name.
+    /// Active Nitro plan (canonical name); `None` when no Nitro plan is
+    /// active or the readback failed.
     pub plan: Option<String>,
     /// Read-back smart-charge state.
     pub smart_charge: Option<bool>,
@@ -157,8 +158,9 @@ impl<M: MiTransport, T: HidTransport, P: PlanApi> AppCore<M, T, P> {
             },
             Some(_) | None => None,
         };
-        let plan = match self.power.active_plan_name() {
-            Ok(name) => Some(name),
+        let plan = match self.power.active_profile() {
+            Ok(Some(profile)) => Some(profile.plan_name().to_string()),
+            Ok(None) => None,
             Err(err) => {
                 LOGGED_PLAN_READ.call_once(|| {
                     log::warn(format!("power: active plan readback failed: {err:?}"));
@@ -220,19 +222,20 @@ impl<M: MiTransport, T: HidTransport, P: PlanApi> AppCore<M, T, P> {
         (next, report)
     }
 
-    /// Ensure the four Nitro plans exist (recreate deleted ones).
-    pub fn ensure_nitro_plans(&mut self) {
-        if let Err(err) = self.power.ensure_nitro_plans() {
-            log::error(format!("power: failed to ensure Nitro plans: {err:?}"));
+    /// Ensure plan support: Windows recreates deleted Nitro plans, Linux
+    /// runs quiet (no-op).
+    pub fn ensure_support(&mut self) {
+        if let Err(err) = self.power.ensure_support() {
+            log::error(format!("power: failed to ensure plan support: {err:?}"));
         }
     }
 
-    /// Full enforcement for the current power state, silently: ensure plans,
-    /// then apply the intended state (profile, HID, fan auto, keyboard
-    /// backlight, plan — never smart charge). Used at startup, on power
-    /// transitions, and on resume.
+    /// Full enforcement for the current power state, silently: ensure plan
+    /// support, then apply the intended state (profile, HID, fan auto,
+    /// keyboard backlight, plan — never smart charge). Used at startup, on
+    /// power transitions, and on resume.
     pub fn enforce_now(&mut self) {
-        self.ensure_nitro_plans();
+        self.ensure_support();
         let snapshot = self.refresh_power();
         self.apply_full(snapshot.state);
     }
@@ -240,7 +243,7 @@ impl<M: MiTransport, T: HidTransport, P: PlanApi> AppCore<M, T, P> {
     /// Enforcement against the cached snapshot (no read — the caller owns
     /// the single power-state read of the occasion).
     fn enforce_now_for(&mut self) {
-        self.ensure_nitro_plans();
+        self.ensure_support();
         self.apply_full(self.last_power.state);
     }
 
@@ -313,20 +316,26 @@ impl<M: MiTransport, T: HidTransport, P: PlanApi> AppCore<M, T, P> {
         self.detect_eco(true);
     }
 
-    /// Apply only the Windows plan for a profile (degraded mode: still
-    /// offered when the Acer WMI interface is unavailable). Returns the apply
-    /// outcome, for the tray's status line.
+    /// Apply only the profile's plan (degraded mode: still offered when the
+    /// Acer WMI interface is unavailable). Returns the apply outcome, for
+    /// the tray's status line. A partial backend failure surfaces its
+    /// per-item failures verbatim (granular tray status); any other error
+    /// is reported as the single "plan" item.
     pub fn apply_plan(&self, profile: Profile) -> ApplyReport {
         let plan = profile.plan_name();
-        match self.power.set_active_plan(plan) {
+        match self.power.set_profile(profile) {
             Ok(()) => {
                 log::info(format!("power: active plan set to {plan}"));
                 ApplyReport::default()
             }
             Err(err) => {
                 log::warn(format!("power: failed to set active plan {plan}: {err:?}"));
+                let failed = match err {
+                    PowerError::Partial { failed } => failed,
+                    _ => vec!["plan"],
+                };
                 ApplyReport {
-                    failed: vec!["plan"],
+                    failed,
                     skipped: Vec::new(),
                 }
             }
@@ -426,12 +435,12 @@ impl<M: MiTransport, T: HidTransport, P: PlanApi> AppCore<M, T, P> {
     }
 
     /// Startup occasion (once, from the binary entry point after the tray
-    /// is up): ensure the four Nitro plans exist, enforce the intended state
-    /// for the current power state, and apply smart charge (one of its two
-    /// occasions — the other is the once-a-minute readback tick).
+    /// is up): ensure plan support, enforce the intended state for the
+    /// current power state, and apply smart charge (one of its two occasions
+    /// — the other is the once-a-minute readback tick).
     pub fn on_startup(&mut self) {
         log::info("enforcement: startup");
-        self.ensure_nitro_plans();
+        self.ensure_support();
         self.enforce_now();
         self.apply_smart_charge();
     }
@@ -621,12 +630,19 @@ impl<M: MiTransport, T: HidTransport, P: PlanApi> AppCore<M, T, P> {
                 None => report.skipped.push("keyboard leds"),
             }
         }
-        if let Some(plan) = intent.plan {
-            match self.power.set_active_plan(plan) {
+        if let Some(profile) = intent.plan.and_then(Profile::from_plan_name) {
+            let plan = profile.plan_name();
+            match self.power.set_profile(profile) {
                 Ok(()) => ok(format!("power: active plan set to {plan}")),
                 Err(err) => {
                     log::warn(format!("power: failed to set active plan {plan}: {err:?}"));
-                    report.failed.push("plan");
+                    // A partial backend failure (ticket 05's sysfs EACCES
+                    // path) surfaces its per-item failures verbatim; any
+                    // other error is the single "plan" item.
+                    match err {
+                        PowerError::Partial { failed } => report.failed.extend(failed),
+                        _ => report.failed.push("plan"),
+                    }
                 }
             }
         }
@@ -940,6 +956,27 @@ mod tests {
     }
 
     #[test]
+    fn apply_plan_partial_failure_reports_the_items_verbatim() {
+        let dir = temp_dir("apply-plan-partial");
+        let power = FakePlanApi::new();
+        power.script_set(vec![Err(PowerError::Partial {
+            failed: vec!["governor", "energy_perf_policy"],
+        })]);
+        let app: TestCore = AppCore::new(
+            Config::default(),
+            &dir,
+            None,
+            None,
+            None,
+            power,
+        );
+        let report = app.apply_plan(Profile::Quiet);
+        assert_eq!(report.failed, vec!["governor", "energy_perf_policy"]);
+        assert_eq!(apply_report_text(&report), "Failed: governor, energy_perf_policy");
+        remove_dir(&dir);
+    }
+
+    #[test]
     fn effective_reads_back_through_the_fake_adapters() {
         let dir = temp_dir("effective");
         let wmi = FakeTransport::new();
@@ -949,7 +986,7 @@ mod tests {
         let charge = FakeTransport::new();
         script_charge_ok(&charge);
         let power = FakePlanApi::new();
-        power.script_name(vec![Ok("Nitro-Performance".to_string())]);
+        power.script_active_profile(vec![Ok(Some(Profile::Performance))]);
         let app: TestCore = AppCore::new(
             Config::default(),
             &dir,

@@ -13,6 +13,7 @@ mod probe {
 
     use nitro_tray::adapter::AdapterError;
     use nitro_tray::charge::{CLASS_NAME, ChargeRow, SmartChargeAdapter};
+    use nitro_tray::mi::MiConnection;
     use nitro_tray::wmi::{CLASS_NAME as WMI_CLASS_NAME, WmiAdapter};
 
     fn print_row(label: &str, row: Result<Option<ChargeRow>, AdapterError>) {
@@ -33,7 +34,7 @@ mod probe {
 
     pub fn run() {
         println!("probe_mi: native MI transport (ticket 16)");
-        let adapter = match SmartChargeAdapter::connect() {
+        let adapter = match SmartChargeAdapter::<MiConnection>::connect() {
             Ok(a) => a,
             Err(e) => {
                 eprintln!("connect failed: {e:?}");
@@ -68,7 +69,7 @@ mod probe {
         print_row("  row after", adapter.read_row(1, 1));
 
         println!("== {WMI_CLASS_NAME}: profile readback + fan ==");
-        let wmi = match WmiAdapter::connect() {
+        let wmi = match WmiAdapter::<MiConnection>::connect() {
             Ok(w) => w,
             Err(e) => {
                 println!("    {WMI_CLASS_NAME}: ERROR {e:?}");

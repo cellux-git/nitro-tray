@@ -2,10 +2,10 @@
 mod probe {
     //! Elevated diagnostic for the in-process power wrapper (ticket 04).
     //!
-    //! Prints the active plan, ensures the four Nitro plans exist (idempotent —
-    //! safe to run twice), and lists their names plus the tuned CPU min/max/boost
-    //! read back via `PowerReadACValueIndex`. For on-device verification only;
-    //! not run in this environment.
+    //! Prints the active profile, ensures plan support (idempotent — safe to
+    //! run twice), and lists the four plan names plus the tuned CPU
+    //! min/max/boost read back via `PowerReadACValueIndex`. For on-device
+    //! verification only; not run in this environment.
 
     use nitro_tray::power::{NITRO_PLANS, PowerApi, boost_mode_index, cpu_tuning, read_ac_index};
     use windows_sys::Win32::System::SystemServices::{
@@ -22,14 +22,15 @@ mod probe {
     }
 
     pub fn run() {
-        match PowerApi::active_plan_name() {
-            Ok(name) => println!("active plan: {name}"),
-            Err(e) => println!("active plan: ERROR {e:?}"),
+        match PowerApi::active_profile() {
+            Ok(Some(profile)) => println!("active profile: {}", profile.as_str()),
+            Ok(None) => println!("active profile: none"),
+            Err(e) => println!("active profile: ERROR {e:?}"),
         }
 
-        match PowerApi::ensure_nitro_plans() {
-            Ok(()) => println!("ensure_nitro_plans: OK (idempotent, safe to re-run)"),
-            Err(e) => println!("ensure_nitro_plans: ERROR {e:?}"),
+        match PowerApi::ensure_support() {
+            Ok(()) => println!("ensure_support: OK (idempotent, safe to re-run)"),
+            Err(e) => println!("ensure_support: ERROR {e:?}"),
         }
 
         println!("boost mode registry GUIDs:");

@@ -73,8 +73,8 @@ const BATTERY_PREFIX: &str = "BAT";
 /// never-terminal degrade philosophy.
 #[cfg(target_os = "linux")]
 pub fn read() -> PowerStateSnapshot {
-    let online = read_sysfs_value(AC_PREFIX, "online");
-    let capacity = read_sysfs_value(BATTERY_PREFIX, "capacity");
+    let online = read_sysfs_value(std::path::Path::new(POWER_SUPPLY_DIR), AC_PREFIX, "online");
+    let capacity = read_sysfs_value(std::path::Path::new(POWER_SUPPLY_DIR), BATTERY_PREFIX, "capacity");
     snapshot_from_sysfs(online, capacity)
 }
 
@@ -97,12 +97,16 @@ fn snapshot_from_sysfs(online: Option<u8>, capacity: Option<u8>) -> PowerStateSn
 }
 
 /// Read one sysfs attribute of the first supply whose directory name starts
-/// with `prefix`. `None` when no supply matches or none has a readable,
-/// parseable value — an unreadable/unparseable file falls through to the
-/// next matching supply before giving up (callers degrade to defaults).
-#[cfg(target_os = "linux")]
-fn read_sysfs_value(prefix: &str, file: &str) -> Option<u8> {
-    let entries = std::fs::read_dir(POWER_SUPPLY_DIR).ok()?;
+/// with `prefix`, scanning the given supply directory. `None` when no supply
+/// matches or none has a readable, parseable value — an unreadable/unparseable
+/// file falls through to the next matching supply before giving up (callers
+/// degrade to defaults). The supply directory is a parameter so this
+/// fall-through logic is unit-testable against fixture temp dirs on both
+/// platforms; the Linux reader keeps the hardcoded `/sys/class/power_supply`
+/// constants.
+#[cfg_attr(windows, allow(dead_code))]
+fn read_sysfs_value(dir: &std::path::Path, prefix: &str, file: &str) -> Option<u8> {
+    let entries = std::fs::read_dir(dir).ok()?;
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
         if !name.starts_with(prefix) {
@@ -221,5 +225,73 @@ mod tests {
             let snap = snapshot_from_sysfs(Some(0), Some(percent));
             assert_eq!(snap.percent, percent);
         }
+    }
+
+    fn temp_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "nitro-tray-sysfs-test-{name}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn remove_dir(dir: &std::path::Path) {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn first_matching_supply_with_readable_value_wins() {
+        let dir = temp_dir("first-supply-wins");
+        std::fs::create_dir_all(dir.join("AC0")).unwrap();
+        std::fs::create_dir_all(dir.join("AC1")).unwrap();
+        std::fs::write(dir.join("AC0").join("online"), "1\n").unwrap();
+        std::fs::write(dir.join("AC1").join("online"), "0\n").unwrap();
+        let value = read_sysfs_value(&dir, "AC", "online");
+        remove_dir(&dir);
+        assert_eq!(value, Some(1), "AC0 (created first) must win over AC1");
+    }
+
+    #[test]
+    fn unreadable_value_falls_through_to_next_supply() {
+        let dir = temp_dir("unreadable-falls-through");
+        std::fs::create_dir_all(dir.join("AC0")).unwrap();
+        std::fs::create_dir_all(dir.join("AC1")).unwrap();
+        std::fs::write(dir.join("AC1").join("online"), "1\n").unwrap();
+        let value = read_sysfs_value(&dir, "AC", "online");
+        remove_dir(&dir);
+        assert_eq!(value, Some(1), "AC0 has no online file; AC1 must be read");
+    }
+
+    #[test]
+    fn unparseable_value_falls_through_to_next_supply() {
+        let dir = temp_dir("unparseable-falls-through");
+        std::fs::create_dir_all(dir.join("AC0")).unwrap();
+        std::fs::create_dir_all(dir.join("AC1")).unwrap();
+        std::fs::write(dir.join("AC0").join("online"), "abc\n").unwrap();
+        std::fs::write(dir.join("AC1").join("online"), "1\n").unwrap();
+        let value = read_sysfs_value(&dir, "AC", "online");
+        remove_dir(&dir);
+        assert_eq!(value, Some(1), "unparseable AC0 must fall through to AC1");
+    }
+
+    #[test]
+    fn no_matching_supply_returns_none() {
+        let dir = temp_dir("no-matching-supply");
+        std::fs::create_dir_all(dir.join("BAT1")).unwrap();
+        std::fs::write(dir.join("BAT1").join("capacity"), "85\n").unwrap();
+        let value = read_sysfs_value(&dir, "AC", "online");
+        remove_dir(&dir);
+        assert_eq!(value, None);
+    }
+
+    #[test]
+    fn matching_supply_but_no_such_file_returns_none() {
+        let dir = temp_dir("matching-but-no-file");
+        std::fs::create_dir_all(dir.join("AC0")).unwrap();
+        let value = read_sysfs_value(&dir, "AC", "online");
+        remove_dir(&dir);
+        assert_eq!(value, None);
     }
 }

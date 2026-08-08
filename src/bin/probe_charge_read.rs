@@ -9,6 +9,7 @@ mod probe {
 
     use nitro_tray::adapter::{AdapterError, WMI_NAMESPACE};
     use nitro_tray::charge::{CLASS_NAME, ChargeRow, SmartChargeAdapter};
+    use nitro_tray::mi::MiConnection;
 
     fn print_row(label: &str, row: Result<Option<ChargeRow>, AdapterError>) {
         match row {
@@ -31,7 +32,7 @@ mod probe {
 
     pub fn run() {
         println!("nitro-tray probe: smart charge ({CLASS_NAME}, {WMI_NAMESPACE}) — read only");
-        let adapter = match SmartChargeAdapter::connect() {
+        let adapter = match SmartChargeAdapter::<MiConnection>::connect() {
             Ok(a) => a,
             Err(e) => {
                 println!("connect: ERROR {e:?}");

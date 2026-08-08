@@ -18,17 +18,15 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 use windows_sys::core::w;
 
 use nitro_tray::app::{AppCore, ApplyReport, apply_report_text};
-use nitro_tray::charge::SmartChargeAdapter;
 use nitro_tray::config;
-use nitro_tray::hid::HidAdapter;
 use nitro_tray::hotkey::Hotkey;
 use nitro_tray::log;
-use nitro_tray::policy::Profile;
 use nitro_tray::power::PowerApi;
 use nitro_tray::task;
 use nitro_tray::timers;
-use nitro_tray::tray::{Tray, TrayError, TrayEvent, TrayView};
-use nitro_tray::wmi::WmiAdapter;
+use nitro_tray::tray::{Tray, TrayError};
+use nitro_tray::tray_model::{TrayEvent, TrayView};
+use nitro_tray::wiring;
 
 pub fn run() {
     let Some(exe_path) = executable_path() else {
@@ -47,17 +45,7 @@ pub fn run() {
     }
     log::info("nitro-tray starting");
 
-    // Route panics into the log (with a backtrace) instead of dying silently
-    // on stderr, which is invisible for a GUI-subsystem app.
-    let default_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        log::error(format!("PANIC: {info}"));
-        let backtrace = std::backtrace::Backtrace::capture();
-        if backtrace.status() == std::backtrace::BacktraceStatus::Captured {
-            log::error(format!("backtrace:\n{backtrace}"));
-        }
-        default_hook(info);
-    }));
+    log::install_panic_hook();
 
     let _single_instance = match acquire_single_instance() {
         Ok(handle) => handle,
@@ -72,31 +60,7 @@ pub fn run() {
     log::info("config loaded");
     let hotkey_spec = config.hotkey.clone();
     let reapply_cfg = config.clone();
-    // Wire the production adapters here, across the core's seam: failures
-    // degrade to None (never crash), exactly as the pre-seam core did.
-    let wmi = match WmiAdapter::connect() {
-        Ok(adapter) => Some(adapter),
-        Err(err) => {
-            log::warn(format!(
-                "wmi: adapter unavailable; running degraded: {err:?}"
-            ));
-            None
-        }
-    };
-    let charge = match SmartChargeAdapter::connect() {
-        Ok(adapter) => Some(adapter),
-        Err(err) => {
-            log::warn(format!("charge: smart-charge adapter unavailable: {err:?}"));
-            None
-        }
-    };
-    let hid = match HidAdapter::open() {
-        Ok(adapter) => Some(adapter),
-        Err(err) => {
-            log::warn(format!("hid: usage-mode adapter unavailable: {err:?}"));
-            None
-        }
-    };
+    let (wmi, charge, hid) = wiring::connect_adapters();
     let mut app = AppCore::new(config, &exe_dir, wmi, charge, hid, PowerApi);
     log::info("app core initialized");
 
@@ -250,29 +214,13 @@ fn message_pump(
     }
 }
 
-/// Build the tray view from the app's read-back effective state: the raw
-/// facts (power, percent, effective profile, degraded/eco flags, smart-charge
-/// readback, plan, logon flag). The tray derives the menu contents itself.
+/// Build the tray view from the app's read-back effective state (the shared
+/// core in `tray_model::view_from`): one `effective()` read per view push;
+/// Windows passes `degraded` for both the profile greying and the "Windows
+/// plan" section — menu byte-identical to the pre-split build.
 fn view_from(app: &AppCore) -> TrayView {
     let e = app.effective();
-    TrayView {
-        power: e.power,
-        percent: e.percent,
-        // Read-back firmware profile; when WMI can't report it, the active
-        // Windows plan is still OS-truth and identifies the profile in effect.
-        profile: e
-            .profile
-            .or_else(|| e.plan.as_deref().and_then(Profile::from_plan_name)),
-        degraded: !e.wmi_available,
-        eco_disabled: e.eco_disabled,
-        // Raw read-back; the tray applies the "always intended on" fallback
-        // for the smart-charge menu check mark when the adapter can't report.
-        smart_charge: e.smart_charge,
-        plan: e.plan,
-        // The status line is set by the user-action handlers only.
-        status: None,
-        start_at_logon: app.start_at_logon(),
-    }
+    nitro_tray::tray_model::view_from(&e, !e.wmi_available, !e.wmi_available, app.start_at_logon())
 }
 
 /// Push a view whose status line reports the outcome of a user-initiated

@@ -46,3 +46,4 @@ No installer, no auto-update, no interpreter spawning, fan is auto-only.
 - `issues/06-power-state-sysfs.md` — power state on `/sys/class/power_supply`.
 - `issues/07-tray-hotkey-lifecycle.md` — tray/hotkey/lifecycle/paths.
 - `issues/08-end-to-end-verification.md` — final on-device acceptance (ready-for-human).
+- `issues/09-architecture-deepening.md` — platform-gate review candidates (deepen the plan seam, collapse transport constructors, extract the tray model, sysfs dir seam, rehome platform bodies, share entry-point boot).

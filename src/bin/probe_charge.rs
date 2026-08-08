@@ -9,6 +9,7 @@ mod probe {
 
     use nitro_tray::adapter::AdapterError;
     use nitro_tray::charge::SmartChargeAdapter;
+    use nitro_tray::mi::MiConnection;
 
     fn report(label: &str, result: Result<bool, AdapterError>) {
         match result {
@@ -20,7 +21,7 @@ mod probe {
     pub fn run() {
         println!("nitro-tray probe: smart charge (BatteryControl, ROOT\\WMI)");
         println!("this probe toggles the 80% charge cap; run elevated");
-        let adapter = match SmartChargeAdapter::connect() {
+        let adapter = match SmartChargeAdapter::<MiConnection>::connect() {
             Ok(a) => a,
             Err(e) => {
                 println!("connect: ERROR {e:?}");

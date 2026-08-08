@@ -13,13 +13,13 @@
 //!
 //! `MiConnection`'s raw API (`enumerate_first_instance`/`invoke`/
 //! `new_instance`/`MiInstance`) stays public — the probes use it directly.
+//! The production `impl MiTransport for MiConnection` (and its out-param
+//! probes) lives in `crate::mi::win`; the Linux stub implements the same
+//! seam in `crate::mi::linux`.
 
 use crate::mi::{
     MiError, MI_RESULT_TYPE_MISMATCH,
 };
-
-#[cfg(windows)]
-use crate::mi::{MiConnection, MiInstance};
 
 /// One input element of a method call: a parameter name plus its explicitly
 /// typed value (the type is part of the value — no method-name inference).
@@ -186,91 +186,6 @@ pub trait MiTransport {
     fn connect() -> Result<Self, MiError>
     where
         Self: Sized;
-}
-
-/// The out-param elements the adapters read, probed by name with the type
-/// each method's MOF declares. The real out instance carries more elements
-/// (e.g. the readback's `uBatteryNo`/`uFunctionQuery` echoes); only the
-/// consumed ones cross the seam — absent elements are skipped.
-#[cfg(windows)]
-const OUT_PROBES: &[(&str, OutProbe)] = &[
-    ("gmOutput", OutProbe::U64),
-    ("ReturnValue", OutProbe::U32),
-    ("uReturn", OutProbe::U32),
-    ("uFunctionList", OutProbe::U32),
-    ("uFunctionStatus", OutProbe::U8Array),
-];
-
-#[cfg(windows)]
-enum OutProbe {
-    U64,
-    U32,
-    U8Array,
-}
-
-#[cfg(windows)]
-impl MiTransport for MiConnection {
-    /// The production transport: initiate a fresh MI session, then invoke
-    /// `method` on the first instance of `class` (the `-InputObject` binding
-    /// target — class-level invocation is rejected by the Acer provider,
-    /// ticket 16), build the dynamic input bag from `input`, invoke, then
-    /// pull the probed out params into an `MiOutput`. The
-    /// `MiConnection`/`MiInstance` raw API is unchanged.
-    fn connect() -> Result<Self, MiError> {
-        MiConnection::connect()
-    }
-
-    fn invoke_first_instance(
-        &self,
-        namespace: &str,
-        class: &str,
-        method: &str,
-        input: &MiInput,
-    ) -> Result<Option<MiOutput>, MiError> {
-        let instance = self.enumerate_first_instance(namespace, class)?;
-        let mut input_bag = self.new_instance(&input.class)?;
-        for element in &input.elements {
-            match &element.value {
-                MiValue::U8(value) => input_bag.add_u8(element.name, *value)?,
-                MiValue::U32(value) => input_bag.add_u32(element.name, *value)?,
-                MiValue::U64(value) => input_bag.add_u64(element.name, *value)?,
-                MiValue::U8Array(values) => input_bag.add_u8_array(element.name, values)?,
-            }
-        }
-        let out = self.invoke(namespace, &instance, method, &input_bag)?;
-        match out {
-            None => Ok(None),
-            Some(result) => Ok(Some(MiOutput { elements: out_elements(&result)? })),
-        }
-    }
-}
-
-/// Materialize the probed out params of an out-params instance into owned
-/// elements; an absent element is skipped (`MI_Instance_GetElement` answers
-/// `NO_SUCH_PROPERTY`), a present one with an unexpected type is an error.
-#[cfg(windows)]
-fn out_elements(result: &MiInstance) -> Result<Vec<MiElement>, MiError> {
-    let mut elements = Vec::new();
-    for (name, probe) in OUT_PROBES {
-        match probe {
-            OutProbe::U64 => {
-                if let Some(value) = result.get_u64(name)? {
-                    elements.push(MiElement { name, value: MiValue::U64(value) });
-                }
-            }
-            OutProbe::U32 => {
-                if let Some(value) = result.get_u32(name)? {
-                    elements.push(MiElement { name, value: MiValue::U32(value) });
-                }
-            }
-            OutProbe::U8Array => {
-                if let Some(value) = result.get_u8_array(name)? {
-                    elements.push(MiElement { name, value: MiValue::U8Array(value) });
-                }
-            }
-        }
-    }
-    Ok(elements)
 }
 
 #[cfg(test)]
